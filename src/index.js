@@ -10,6 +10,20 @@ import { captureWorkspaceSnapshot, summarizeWorkspaceChanges } from './workspace
 
 const store = new SessionStore(config.dataDir);
 const activeJobs = new Map();
+const runtimeLogPath = path.join(config.dataDir, 'runtime.log');
+
+async function logRuntime(message, details = null) {
+  const line = [
+    `[${new Date().toISOString()}] ${message}`,
+    details ? JSON.stringify(details, null, 2) : ''
+  ].filter(Boolean).join('\n');
+  try {
+    await fs.mkdir(config.dataDir, { recursive: true });
+    await fs.appendFile(runtimeLogPath, `${line}\n\n`, 'utf8');
+  } catch (error) {
+    console.error('[runtime-log-failed]', error);
+  }
+}
 
 function getStatusLabel(status) {
   switch (status) {
@@ -713,6 +727,18 @@ async function queueTurn(client, event, prompt, alias) {
     .catch(async (error) => {
       const currentSession = store.getSession(chatKey, alias);
       const providerLabel = getProviderLabel(currentSession?.provider || config.defaultAgentProvider);
+      await logRuntime('agent-turn-failed', {
+        chatKey,
+        alias,
+        provider: currentSession?.provider || config.defaultAgentProvider,
+        workspace: currentSession?.workspace || config.defaultWorkspace,
+        error: {
+          message: error?.message || '未知错误',
+          stderr: error?.stderr || '',
+          exitCode: error?.exitCode ?? null,
+          stack: error?.stack || ''
+        }
+      });
       await store.updateSession(chatKey, alias, {
         status: 'error',
         currentTaskPreview: '',
@@ -752,65 +778,81 @@ async function main() {
 
   const dispatcher = new Lark.EventDispatcher({}).register({
     'im.message.receive_v1': async (payload) => {
-      const event = payload.event ?? payload;
-      const message = event?.message;
-      console.log('[event]', {
-        type: 'im.message.receive_v1',
-        chatId: message?.chat_id,
-        messageType: message?.message_type,
-        senderOpenId: getSenderOpenId(event)
-      });
+      try {
+        const event = payload.event ?? payload;
+        const message = event?.message;
+        console.log('[event]', {
+          type: 'im.message.receive_v1',
+          chatId: message?.chat_id,
+          messageType: message?.message_type,
+          senderOpenId: getSenderOpenId(event)
+        });
 
-      if (!message) {
-        return;
-      }
-
-      if (message.message_type !== 'text') {
-        await sendTextMessage(client, message.chat_id, '当前 MVP 只支持文本消息。');
-        return;
-      }
-
-      const senderOpenId = getSenderOpenId(event);
-      if (config.feishuBotOpenId && senderOpenId === config.feishuBotOpenId) {
-        return;
-      }
-
-      const text = getTextContent(message.content);
-      console.log('[message]', { chatId: message.chat_id, text });
-      if (!text) {
-        await sendTextMessage(client, message.chat_id, '没有解析到文本内容，请直接发送文本消息。');
-        return;
-      }
-
-      if (await handleCommand(client, event, text)) {
-        return;
-      }
-
-      const chatKey = getChatKey(event);
-      const prefixed = parseSessionPrefixedPrompt(text);
-      let alias;
-      let prompt;
-
-      if (prefixed) {
-        alias = prefixed.alias;
-        prompt = prefixed.prompt;
-        const targetSession = store.getSession(chatKey, alias);
-        if (!targetSession) {
-          await sendTextMessage(client, message.chat_id, `没有找到 ${alias}。发送 /sessions 看最近会话，或 /new 新建一个。`);
+        if (!message) {
           return;
         }
-      } else {
-        const active = await store.ensureActiveSession(chatKey);
-        alias = active.alias;
-        prompt = text;
-      }
 
-      if (!prompt) {
-        await sendTextMessage(client, message.chat_id, '没有解析到要发送给 Codex 的文本。');
-        return;
-      }
+        if (message.message_type !== 'text') {
+          await sendTextMessage(client, message.chat_id, '当前 MVP 只支持文本消息。');
+          return;
+        }
 
-      void queueTurn(client, event, prompt, alias);
+        const senderOpenId = getSenderOpenId(event);
+        if (config.feishuBotOpenId && senderOpenId === config.feishuBotOpenId) {
+          return;
+        }
+
+        const text = getTextContent(message.content);
+        console.log('[message]', { chatId: message.chat_id, text });
+        if (!text) {
+          await sendTextMessage(client, message.chat_id, '没有解析到文本内容，请直接发送文本消息。');
+          return;
+        }
+
+        if (await handleCommand(client, event, text)) {
+          return;
+        }
+
+        const chatKey = getChatKey(event);
+        const prefixed = parseSessionPrefixedPrompt(text);
+        let alias;
+        let prompt;
+
+        if (prefixed) {
+          alias = prefixed.alias;
+          prompt = prefixed.prompt;
+          const targetSession = store.getSession(chatKey, alias);
+          if (!targetSession) {
+            await sendTextMessage(client, message.chat_id, `没有找到 ${alias}。发送 /sessions 看最近会话，或 /new 新建一个。`);
+            return;
+          }
+        } else {
+          const active = await store.ensureActiveSession(chatKey);
+          alias = active.alias;
+          prompt = text;
+        }
+
+        if (!prompt) {
+          await sendTextMessage(client, message.chat_id, '没有解析到要发送给 Codex 的文本。');
+          return;
+        }
+
+        void queueTurn(client, event, prompt, alias);
+      } catch (error) {
+        const event = payload.event ?? payload;
+        const message = event?.message;
+        await logRuntime('message-handler-failed', {
+          chatId: message?.chat_id || '',
+          rawContent: message?.content || '',
+          error: {
+            message: error?.message || '未知错误',
+            stack: error?.stack || ''
+          }
+        });
+        if (message?.chat_id) {
+          await sendTextMessage(client, message.chat_id, '机器人处理这条消息时出了点问题。我已经把错误记到日志里了，你可以稍后重试一次。');
+        }
+      }
     }
   });
 
@@ -822,6 +864,22 @@ async function main() {
 
   wsClient.start({
     eventDispatcher: dispatcher
+  });
+
+  process.on('unhandledRejection', (reason) => {
+    console.error('[unhandledRejection]', reason);
+    void logRuntime('unhandled-rejection', {
+      reason: reason instanceof Error
+        ? { message: reason.message, stack: reason.stack || '' }
+        : { value: String(reason) }
+    });
+  });
+
+  process.on('uncaughtException', (error) => {
+    console.error('[uncaughtException]', error);
+    void logRuntime('uncaught-exception', {
+      error: { message: error.message, stack: error.stack || '' }
+    });
   });
 
   process.on('SIGINT', async () => {

@@ -58,6 +58,28 @@ function extractProcessErrorDetail(provider, stdout, stderr) {
   return safeTrim(stderr) || safeTrim(stdout) || '未知错误';
 }
 
+function extractCodexErrorDetail(stderr, events) {
+  const stderrText = safeTrim(stderr);
+  if (stderrText) {
+    return stderrText;
+  }
+
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    const candidates = [
+      event?.message,
+      event?.error?.message,
+      event?.item?.error?.message,
+      event?.item?.text
+    ].filter((value) => typeof value === 'string' && value.trim());
+    if (candidates.length) {
+      return safeTrim(candidates[0]);
+    }
+  }
+
+  return 'Codex 执行失败，但没有返回可读错误信息。';
+}
+
 function buildCodexArgs(config, sessionId, prompt, workspace) {
   const args = ['exec', '--json', '-C', workspace];
   if (config.codexSkipGitRepoCheck) {
@@ -116,9 +138,11 @@ async function runCodexTurn({ sessionId, prompt, config, workspace }) {
   stdoutRl.close();
 
   if (exitCode !== 0) {
-    const error = new Error(`Codex exited with code ${exitCode}`);
+    const detail = extractCodexErrorDetail(stderr, events);
+    const error = new Error(detail);
     error.exitCode = exitCode;
-    error.stderr = stderr;
+    error.stderr = detail;
+    error.rawStderr = stderr;
     error.events = events;
     throw error;
   }
@@ -169,6 +193,76 @@ async function runPrintAgent({ provider, bin, args, workspace, sessionId }) {
   };
 }
 
+async function runTextAgent({ provider, bin, args, workspace, sessionId }) {
+  const child = spawn(bin, args, {
+    cwd: workspace,
+    env: process.env,
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (chunk) => {
+    stdout += chunk.toString('utf8');
+  });
+  child.stderr.on('data', (chunk) => {
+    stderr += chunk.toString('utf8');
+  });
+
+  const exitCode = await collectExit(child);
+  if (exitCode !== 0) {
+    const detail = extractProcessErrorDetail(provider, stdout, stderr);
+    const error = new Error(detail);
+    error.exitCode = exitCode;
+    error.stderr = detail;
+    error.stdout = safeTrim(stdout);
+    error.rawStderr = stderr;
+    throw error;
+  }
+
+  return {
+    provider,
+    sessionId: sessionId || null,
+    output: safeTrim(stdout),
+    stderr,
+    events: stdout ? [{ type: 'agent_text', raw: safeTrim(stdout) }] : []
+  };
+}
+
+async function createCursorChat(config, workspace) {
+  const child = spawn(config.cursorAgentBin, ['create-chat'], {
+    cwd: workspace,
+    env: process.env,
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (chunk) => {
+    stdout += chunk.toString('utf8');
+  });
+  child.stderr.on('data', (chunk) => {
+    stderr += chunk.toString('utf8');
+  });
+
+  const exitCode = await collectExit(child);
+  if (exitCode !== 0) {
+    const detail = extractProcessErrorDetail('cursor', stdout, stderr);
+    const error = new Error(detail);
+    error.exitCode = exitCode;
+    error.stderr = detail;
+    error.stdout = safeTrim(stdout);
+    error.rawStderr = stderr;
+    throw error;
+  }
+
+  const chatId = safeTrim(stdout);
+  if (!chatId) {
+    throw new Error('Cursor Agent 没有返回 chat id。');
+  }
+  return chatId;
+}
+
 async function runClaudeTurn({ sessionId, prompt, config, workspace }) {
   const args = ['-p', '--output-format', 'json'];
   if (config.claudePermissionMode) {
@@ -188,15 +282,13 @@ async function runClaudeTurn({ sessionId, prompt, config, workspace }) {
 }
 
 async function runCursorTurn({ sessionId, prompt, config, workspace }) {
-  const args = ['-p', '--output-format', 'json'];
+  const chatId = sessionId || await createCursorChat(config, workspace);
+  const args = ['-p', '--output-format', 'text', '--force', '--resume', chatId];
   if (config.cursorModel) {
     args.push('--model', config.cursorModel);
   }
-  if (sessionId) {
-    args.push('--resume', sessionId);
-  }
   args.push(prompt);
-  return runPrintAgent({ provider: 'cursor', bin: config.cursorAgentBin, args, workspace, sessionId });
+  return runTextAgent({ provider: 'cursor', bin: config.cursorAgentBin, args, workspace, sessionId: chatId });
 }
 
 async function runOpenCodeTurn({ sessionId, prompt, config, workspace }) {
