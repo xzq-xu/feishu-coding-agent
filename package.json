@@ -1,0 +1,19 @@
+{
+  "name": "feishu-coding-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Feishu Coding Agent: a Feishu WebSocket bot that forwards messages to Codex CLI and posts replies back to Feishu.",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "check": "node --check src/*.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.60.0",
+    "dotenv": "^16.6.1"
+  }
+}
