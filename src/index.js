@@ -161,7 +161,7 @@ function formatRecentSessions(chatKey) {
 
 function buildResultCard({ chatKey, alias, output, sessionId, workspace, status = 'idle', provider = 'codex', branchChange = null, commitChange = null, title = 'Agent 结果' }) {
   const record = store.get(chatKey);
-  const sessions = store.listSessions(chatKey).slice(0, RECENT_SESSION_LIMIT);
+  const sessionCount = store.listSessions(chatKey).length;
   const elements = [
     {
       tag: 'markdown',
@@ -184,35 +184,18 @@ function buildResultCard({ chatKey, alias, output, sessionId, workspace, status 
     }
   ];
 
-  if (sessions.length) {
-    elements.push({ tag: 'hr' });
-    elements.push({
-      tag: 'markdown',
-      content: '**最近会话**'
-    });
-
-    for (const session of sessions) {
-      const effectiveStatus = getEffectiveSessionStatus(chatKey, session);
-      const isActive = record.activeAlias === session.alias;
-      const preview = trimPreview(
-        effectiveStatus === 'running'
-          ? session.currentTaskPreview || session.lastUserMessage || session.title
-          : session.lastResultPreview || session.lastAssistantMessage || session.lastUserMessage || session.title,
-        80
-      );
-      const sessionWorkspace = trimPreview(session.workspace || config.defaultWorkspace, 50);
-      elements.push({
-        tag: 'markdown',
-        content: `**${session.alias}${isActive ? ' · 当前' : ''} · ${getStatusLabel(effectiveStatus)} · ${getProviderLabel(session.provider)}**\n${preview}\n目录: \`${sessionWorkspace}\``
-      });
-    }
-  }
+  elements.push({ tag: 'hr' });
+  elements.push({
+    tag: 'markdown',
+    content: `**会话总览**\n当前聊天共有 **${sessionCount}** 个会话。\n发送 \`/sessions\` 查看完整列表。`
+  });
 
   elements.push({ tag: 'hr' });
   elements.push({
     tag: 'markdown',
     content: [
       '**快捷命令**',
+      '直接回复这条消息或这条线程里的任意消息，也会继续当前会话',
       `继续这个会话: \`${alias}: 你的新指令\``,
       `查看最近消息: \`/show ${alias}\``,
       `修改工作目录: \`/cwd ${alias} /path/to/project\``,
@@ -378,6 +361,15 @@ function getSenderOpenId(event) {
   return event.sender?.sender_id?.open_id || '';
 }
 
+function getThreadRootMessageId(event) {
+  const message = event?.message;
+  return message?.root_id || message?.parent_id || null;
+}
+
+function getMessageId(event) {
+  return event?.message?.message_id || null;
+}
+
 function formatHelp() {
   return [
     'Codex 飞书机器人已就绪。',
@@ -392,6 +384,8 @@ function formatHelp() {
     '/new cursor：创建一个使用 Cursor Agent 的新会话',
     '/new cursor /path/to/project：创建新会话并同时指定 Agent 和目录',
     '/new cursor /path/to/project 你的第一条指令：创建新会话并立即开始',
+    '/thread：为当前会话创建或刷新一个话题入口',
+    '/thread S1：为指定会话创建或刷新一个话题入口',
     '/cwd：查看当前活跃会话的工作目录',
     '/cwd /path/to/project：修改当前活跃会话的工作目录',
     '/cwd S1 /path/to/project：修改指定会话的工作目录',
@@ -416,6 +410,7 @@ function formatUnknownCommand(command) {
     '',
     '可用命令:',
     '/new',
+    '/thread',
     '/cwd',
     '/stop',
     '/delete',
@@ -447,10 +442,23 @@ function formatStatus(chatKey) {
   ].filter(Boolean).join('\n');
 }
 
-async function sendTextMessage(client, chatId, text) {
+async function sendTextMessage(client, chatId, text, replyToMessageId = null) {
   const safeText = text.slice(0, 30000) || 'Codex 已完成，但没有返回正文。';
   console.log('[send]', { chatId, preview: safeText.slice(0, 120) });
-  await client.im.v1.message.create({
+  if (replyToMessageId) {
+    const response = await client.im.v1.message.reply({
+      path: {
+        message_id: replyToMessageId
+      },
+      data: {
+        msg_type: 'text',
+        content: JSON.stringify({ text: safeText }),
+        reply_in_thread: true
+      }
+    });
+    return response?.data || null;
+  }
+  const response = await client.im.v1.message.create({
     params: {
       receive_id_type: 'chat_id'
     },
@@ -460,12 +468,26 @@ async function sendTextMessage(client, chatId, text) {
       content: JSON.stringify({ text: safeText })
     }
   });
+  return response?.data || null;
 }
 
-async function sendResultCard(client, chatId, payload) {
+async function sendResultCard(client, chatId, payload, replyToMessageId = null) {
   const card = buildResultCard(payload);
   console.log('[send-card]', { chatId, alias: payload.alias, preview: trimPreview(payload.output, 120) });
-  await client.im.v1.message.create({
+  if (replyToMessageId) {
+    const response = await client.im.v1.message.reply({
+      path: {
+        message_id: replyToMessageId
+      },
+      data: {
+        msg_type: 'interactive',
+        content: JSON.stringify(card),
+        reply_in_thread: true
+      }
+    });
+    return response?.data || null;
+  }
+  const response = await client.im.v1.message.create({
     params: {
       receive_id_type: 'chat_id'
     },
@@ -475,6 +497,15 @@ async function sendResultCard(client, chatId, payload) {
       content: JSON.stringify(card)
     }
   });
+  return response?.data || null;
+}
+
+async function registerOutboundMessage(chatKey, alias, responseData) {
+  const messageId = responseData?.message_id;
+  if (!messageId) {
+    return;
+  }
+  await store.registerMessageId(chatKey, alias, messageId).catch(() => {});
 }
 
 async function resetSession(client, event) {
@@ -513,6 +544,38 @@ async function stopSessionRun(chatKey, alias) {
   return true;
 }
 
+async function ensureSessionRootMessage(client, event, chatKey, session, options = {}) {
+  const existing = store.getSession(chatKey, session.alias);
+  if (existing?.rootMessageId && !options.forceNew) {
+    return existing.rootMessageId;
+  }
+
+  const lines = [
+    options.forceNew ? `已为 ${session.alias} 创建新的话题入口。` : `已创建新会话 ${session.alias}。`,
+    `Agent: ${getProviderLabel(session.provider || config.defaultAgentProvider)}`,
+    `工作目录: ${session.workspace || config.defaultWorkspace}`,
+    options.promptQueued ? '你的首条指令也已收到，后续结果会回复在这个话题下。' : '现在直接回复这条消息，默认就会进入这个会话。',
+    '',
+    formatRecentSessions(chatKey)
+  ];
+  const created = await sendTextMessage(client, event.message.chat_id, lines.join('\n'));
+  const rootMessageId = created?.message_id || null;
+  if (rootMessageId) {
+    await store.updateSession(chatKey, session.alias, { rootMessageId });
+    await store.registerMessageId(chatKey, session.alias, rootMessageId);
+    session.rootMessageId = rootMessageId;
+  }
+  return rootMessageId;
+}
+
+function resolveSessionFromThread(chatKey, event) {
+  const rootMessageId = getThreadRootMessageId(event);
+  if (!rootMessageId) {
+    return null;
+  }
+  return store.findSessionByRootMessageId(chatKey, rootMessageId);
+}
+
 async function handleCommand(client, event, text) {
   const command = text.trim();
   const chatKey = getChatKey(event);
@@ -528,7 +591,8 @@ async function handleCommand(client, event, text) {
   }
 
   if (command.toLowerCase() === '/agent') {
-    const session = await store.ensureActiveSession(chatKey);
+    const threadSession = resolveSessionFromThread(chatKey, event);
+    const session = threadSession || await store.ensureActiveSession(chatKey);
     await sendTextMessage(
       client,
       event.message.chat_id,
@@ -578,39 +642,37 @@ async function handleCommand(client, event, text) {
     }
 
     if (parsed.prompt) {
-      await sendTextMessage(
-        client,
-        event.message.chat_id,
-        [
-          `已创建新会话 ${session.alias}。`,
-          `Agent: ${getProviderLabel(session.provider || config.defaultAgentProvider)}`,
-          `工作目录: ${session.workspace || config.defaultWorkspace}`,
-          '你的首条指令也已收到，马上开始执行。',
-          '',
-          formatRecentSessions(chatKey)
-        ].join('\n')
-      );
+      await ensureSessionRootMessage(client, event, chatKey, session, { promptQueued: true });
       void queueTurn(client, event, parsed.prompt, session.alias);
       return true;
     }
 
-    await sendTextMessage(
-      client,
-      event.message.chat_id,
-      [
-        `已创建新会话 ${session.alias}。`,
-        `Agent: ${getProviderLabel(session.provider || config.defaultAgentProvider)}`,
-        `工作目录: ${session.workspace || config.defaultWorkspace}`,
-        '现在直接发送文本，默认会进入这个新会话。',
-        '',
-        formatRecentSessions(chatKey)
-      ].join('\n')
-    );
+    await ensureSessionRootMessage(client, event, chatKey, session, { promptQueued: false });
+    return true;
+  }
+
+  if (command.toLowerCase() === '/thread') {
+    const threadSession = resolveSessionFromThread(chatKey, event);
+    const session = threadSession || await store.ensureActiveSession(chatKey);
+    await ensureSessionRootMessage(client, event, chatKey, session, { forceNew: true, promptQueued: false });
+    return true;
+  }
+
+  const threadMatch = command.match(/^\/thread\s+(S\d+)$/i);
+  if (threadMatch) {
+    const alias = threadMatch[1].toUpperCase();
+    const session = store.getSession(chatKey, alias);
+    if (!session) {
+      await sendTextMessage(client, event.message.chat_id, `没有找到 ${alias}。发送 /sessions 看最近会话。`);
+      return true;
+    }
+    await ensureSessionRootMessage(client, event, chatKey, session, { forceNew: true, promptQueued: false });
     return true;
   }
 
   if (command.toLowerCase() === '/cwd') {
-    const session = await store.ensureActiveSession(chatKey);
+    const threadSession = resolveSessionFromThread(chatKey, event);
+    const session = threadSession || await store.ensureActiveSession(chatKey);
     await sendTextMessage(client, event.message.chat_id, formatWorkspaceStatus(chatKey, session));
     return true;
   }
@@ -760,7 +822,7 @@ async function handleCommand(client, event, text) {
 
   const diffMatch = command.match(/^\/diff(?:\s+(S\d+))?$/i);
   if (diffMatch) {
-    const alias = diffMatch[1]?.toUpperCase() || store.get(chatKey).activeAlias;
+    const alias = diffMatch[1]?.toUpperCase() || resolveSessionFromThread(chatKey, event)?.alias || store.get(chatKey).activeAlias;
     if (!alias) {
       await sendTextMessage(client, event.message.chat_id, '当前没有可查看 diff 的会话。');
       return true;
@@ -804,10 +866,23 @@ async function queueTurn(client, event, prompt, alias) {
       const session = await store.touchSession(chatKey, alias);
       const workspace = session?.workspace || config.defaultWorkspace;
       const provider = session?.provider || config.defaultAgentProvider;
+      const rootMessageId = session?.rootMessageId || null;
+      const incomingMessageId = getMessageId(event);
+      const replyTargetMessageId = incomingMessageId || rootMessageId || null;
       const opening = session?.sessionId
         ? `已收到，继续 ${alias}（${getProviderLabel(provider)}）处理中。`
         : `已收到，正在为你启动新的会话 ${alias}（${getProviderLabel(provider)}）。`;
-      await sendTextMessage(client, event.message.chat_id, opening);
+      if (replyTargetMessageId) {
+        const reply = await sendTextMessage(client, event.message.chat_id, opening, replyTargetMessageId);
+        await registerOutboundMessage(chatKey, alias, reply);
+      } else {
+        const created = await sendTextMessage(client, event.message.chat_id, opening);
+        if (created?.message_id) {
+          await store.updateSession(chatKey, alias, { rootMessageId: created.message_id });
+          session.rootMessageId = created.message_id;
+          await registerOutboundMessage(chatKey, alias, created);
+        }
+      }
 
       await store.appendTurn(chatKey, alias, {
         role: 'user',
@@ -856,7 +931,7 @@ async function queueTurn(client, event, prompt, alias) {
         createdAt: new Date().toISOString()
       });
 
-      await sendResultCard(client, event.message.chat_id, {
+      const cardReply = await sendResultCard(client, event.message.chat_id, {
         chatKey,
         alias,
         output: [
@@ -872,7 +947,8 @@ async function queueTurn(client, event, prompt, alias) {
         branchChange: diff.branchChange,
         commitChange: diff.commitChange,
         title: `${getProviderLabel(provider)} 结果`
-      });
+      }, replyTargetMessageId || session?.rootMessageId || null);
+      await registerOutboundMessage(chatKey, alias, cardReply);
     })
     .catch(async (error) => {
       const currentSession = store.getSession(chatKey, alias);
@@ -918,11 +994,13 @@ async function queueTurn(client, event, prompt, alias) {
         updatedAt: new Date().toISOString()
       }).catch(() => {});
       const detail = (error.stderr || error.message || '未知错误').trim().slice(0, 4000);
-      await sendTextMessage(
+      const errorReply = await sendTextMessage(
         client,
         event.message.chat_id,
-        [`${providerLabel} 执行失败。`, '', detail || '没有拿到更多错误信息。', '', '发送 /status 查看当前状态，或 /new 重开会话。'].join('\n')
+        [`${providerLabel} 执行失败。`, '', detail || '没有拿到更多错误信息。', '', '发送 /status 查看当前状态，或 /new 重开会话。'].join('\n'),
+        getMessageId(event) || currentSession?.rootMessageId || null
       );
+      await registerOutboundMessage(chatKey, alias, errorReply);
     })
     .finally(() => {
       activeProcesses.delete(jobKey);
@@ -982,6 +1060,7 @@ async function main() {
         }
 
         const chatKey = getChatKey(event);
+        const threadSession = resolveSessionFromThread(chatKey, event);
         const prefixed = parseSessionPrefixedPrompt(text);
         let alias;
         let prompt;
@@ -995,8 +1074,8 @@ async function main() {
             return;
           }
         } else {
-          const active = await store.ensureActiveSession(chatKey);
-          alias = active.alias;
+          const target = threadSession || await store.ensureActiveSession(chatKey);
+          alias = target.alias;
           prompt = text;
         }
 

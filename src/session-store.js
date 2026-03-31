@@ -20,6 +20,8 @@ function normalizeSession(alias, session) {
   return {
     alias,
     sessionId: session?.sessionId || null,
+    rootMessageId: session?.rootMessageId || null,
+    messageIds: Array.isArray(session?.messageIds) ? session.messageIds.filter((id) => typeof id === 'string' && id) : [],
     provider: session?.provider || 'codex',
     title: session?.title || alias,
     workspace: session?.workspace || null,
@@ -134,6 +136,36 @@ export class SessionStore {
   getSession(chatKey, alias) {
     const record = this.get(chatKey);
     return record.sessions[alias] || null;
+  }
+
+  findSessionByRootMessageId(chatKey, rootMessageId) {
+    if (!rootMessageId) {
+      return null;
+    }
+    const record = this.get(chatKey);
+    return Object.values(record.sessions).find((session) => (
+      session.rootMessageId === rootMessageId || session.messageIds.includes(rootMessageId)
+    )) || null;
+  }
+
+  async registerMessageId(chatKey, alias, messageId) {
+    if (!messageId) {
+      return null;
+    }
+    const record = this.get(chatKey);
+    const session = record.sessions[alias];
+    if (!session) {
+      throw new Error(`Unknown session alias: ${alias}`);
+    }
+    if (!session.messageIds.includes(messageId)) {
+      session.messageIds.push(messageId);
+      if (session.messageIds.length > 50) {
+        session.messageIds = session.messageIds.slice(-50);
+      }
+      session.updatedAt = new Date().toISOString();
+      await this.flush();
+    }
+    return session;
   }
 
   async createSession(chatKey) {
