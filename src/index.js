@@ -14,6 +14,7 @@ const activeProcesses = new Map();
 const stopRequests = new Set();
 const runtimeLogPath = path.join(config.dataDir, 'runtime.log');
 const RECENT_SESSION_LIMIT = 5;
+const REFERENCED_MESSAGE_KEYS = ['quote_message_id', 'upper_message_id', 'reply_message_id', 'source_message_id'];
 const botIdentity = {
   names: new Set()
 };
@@ -468,6 +469,73 @@ function getMessageId(event) {
   return event?.message?.message_id || null;
 }
 
+function collectReferencedMessageIds(value, results = new Set()) {
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectReferencedMessageIds(item, results));
+    return results;
+  }
+
+  if (!value || typeof value !== 'object') {
+    return results;
+  }
+
+  for (const [key, nestedValue] of Object.entries(value)) {
+    if (REFERENCED_MESSAGE_KEYS.includes(key) && typeof nestedValue === 'string' && nestedValue.trim()) {
+      results.add(nestedValue.trim());
+    }
+    collectReferencedMessageIds(nestedValue, results);
+  }
+
+  return results;
+}
+
+function getQuotedMessageId(event) {
+  const message = event?.message;
+  const excluded = new Set([message?.message_id].filter(Boolean));
+
+  const directCandidates = [
+    message?.upper_message_id,
+    message?.quote_message_id,
+    event?.upper_message_id,
+    event?.quote_message_id
+  ].filter(Boolean);
+
+  for (const candidate of directCandidates) {
+    if (!excluded.has(candidate)) {
+      return candidate;
+    }
+  }
+
+  const parsed = parseMessageContent(message?.content || '{}');
+  const nestedCandidates = Array.from(collectReferencedMessageIds(parsed));
+  return nestedCandidates.find((candidate) => !excluded.has(candidate)) || null;
+}
+
+function getDirectReplyMessageId(event) {
+  const message = event?.message;
+  if (!message || message.thread_id) {
+    return null;
+  }
+
+  const currentMessageId = message.message_id || null;
+  const candidates = [
+    message.parent_id,
+    message.root_id
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    if (candidate && candidate !== currentMessageId) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+function getReferencedMessageId(event) {
+  return getQuotedMessageId(event) || getDirectReplyMessageId(event);
+}
+
 function cleanPromptText(text, event) {
   let cleaned = (text || '').trim();
   for (const mention of getMentions(event)) {
@@ -488,8 +556,97 @@ function extractMessageBodyText(item) {
   return getTextContent(raw);
 }
 
+async function fetchReferencedMessage(client, event) {
+  const referencedMessageId = getReferencedMessageId(event);
+  if (!referencedMessageId) {
+    return null;
+  }
+
+  try {
+    const response = await client.im.v1.message.get({
+      path: {
+        message_id: referencedMessageId
+      }
+    });
+    const item = response?.data?.items?.[0] || null;
+    if (!item) {
+      return null;
+    }
+
+    const text = extractMessageBodyText(item);
+    const attachments = await downloadAttachmentsForMessage(client, item);
+    if (!text) {
+      return {
+        messageId: referencedMessageId,
+        text: '',
+        attachments,
+        msgType: item.msg_type || null,
+        senderType: item.sender?.sender_type || null
+      };
+    }
+
+    return {
+      messageId: referencedMessageId,
+      text,
+      attachments,
+      msgType: item.msg_type || null,
+      senderType: item.sender?.sender_type || null
+    };
+  } catch (error) {
+    await logRuntime('referenced-message-fetch-failed', {
+      chatId: event?.message?.chat_id || '',
+      messageId: getMessageId(event) || '',
+      referencedMessageId,
+      error: error?.message || '未知错误'
+    });
+    return null;
+  }
+}
+
+function buildReferencedMessagePrompt(referencedMessage, text = '') {
+  if (!referencedMessage?.text && !referencedMessage?.attachments?.length) {
+    return text;
+  }
+
+  const cleanedText = (text || '').trim();
+  const lines = [
+    '以下是用户在本轮消息里显式引用的原消息，请把它当作这次任务的重要上下文：',
+    ''
+  ];
+
+  if (referencedMessage.text) {
+    lines.push(`被引用消息: ${referencedMessage.text}`);
+  }
+
+  if (referencedMessage.attachments?.length) {
+    lines.push(
+      '被引用消息附件已下载到本地，请直接使用这些绝对路径：',
+      ...referencedMessage.attachments.map((item) => `- [${item.type}] ${item.path}`)
+    );
+  }
+
+  if (cleanedText) {
+    lines.push('', `当前用户指令: ${cleanedText}`);
+  }
+
+  return lines.join('\n');
+}
+
 function getAttachmentPayload(message) {
   return parseMessageContent(message?.content || '{}');
+}
+
+function normalizeMessageForDownload(message) {
+  if (!message) {
+    return null;
+  }
+
+  return {
+    message_id: message.message_id || null,
+    chat_id: message.chat_id || 'chat',
+    message_type: message.message_type || message.msg_type || null,
+    content: message.content || message.body?.content || '{}'
+  };
 }
 
 function extractPostAttachments(message) {
@@ -601,8 +758,8 @@ function scheduleDownloadCleanup() {
   return cleanupPromise;
 }
 
-async function downloadMessageAttachment(client, event) {
-  const message = event?.message;
+async function downloadAttachmentsForMessage(client, rawMessage) {
+  const message = normalizeMessageForDownload(rawMessage);
   if (!message?.message_id) {
     return [];
   }
@@ -658,6 +815,10 @@ async function downloadMessageAttachment(client, event) {
 
   await scheduleDownloadCleanup();
   return downloads;
+}
+
+async function downloadMessageAttachment(client, event) {
+  return downloadAttachmentsForMessage(client, event?.message);
 }
 
 function buildAttachmentPrompt(attachments, text = '') {
@@ -812,6 +973,7 @@ function formatHelp() {
     '/stop S1：停止指定会话',
     '/delete：删除当前活跃会话',
     '/delete S1：删除指定会话，并自动整理编号',
+    '/show：在线程里查看当前会话最近 10 条消息',
     '/show S1：查看某个会话最近 10 条消息',
     '/diff S1：查看某个会话最近一轮代码改动摘要',
     '/sessions：查看最近活跃的几个会话',
@@ -1006,7 +1168,7 @@ function resolveSessionFromThread(chatKey, event) {
   return null;
 }
 
-async function handleCommand(client, event, text) {
+async function handleCommand(client, event, text, options = {}) {
   const command = text.trim();
   const chatKey = getChatKey(event);
 
@@ -1062,9 +1224,10 @@ async function handleCommand(client, event, text) {
       session.workspace = parsed.workspace;
     }
 
-    if (parsed.prompt) {
+    const initialPrompt = buildReferencedMessagePrompt(options.referencedMessage, parsed.prompt || '');
+    if (initialPrompt) {
       await ensureSessionRootMessage(client, event, chatKey, session, { promptQueued: true });
-      void queueTurn(client, event, parsed.prompt, session.alias);
+      void queueTurn(client, event, initialPrompt, session.alias);
       return true;
     }
 
@@ -1210,9 +1373,13 @@ async function handleCommand(client, event, text) {
     return true;
   }
 
-  const showMatch = command.match(/^\/show\s+(S\d+)$/i);
+  const showMatch = command.match(/^\/show(?:\s+(S\d+))?$/i);
   if (showMatch) {
-    const alias = showMatch[1].toUpperCase();
+    const alias = showMatch[1]?.toUpperCase() || resolveSessionFromThread(chatKey, event)?.alias || store.get(chatKey).activeAlias;
+    if (!alias) {
+      await sendTextMessage(client, event.message.chat_id, '当前没有可查看消息记录的会话。');
+      return true;
+    }
     const session = store.getSession(chatKey, alias);
     if (!session) {
       await sendTextMessage(client, event.message.chat_id, `没有找到 ${alias}。发送 /sessions 看最近会话。`);
@@ -1454,8 +1621,9 @@ async function main() {
   }
 
   const dispatcher = new Lark.EventDispatcher({}).register({
-    'im.message.receive_v1': async (payload) => {
-      try {
+    'im.message.receive_v1': (payload) => {
+      void (async () => {
+        try {
         const event = payload.event ?? payload;
         const message = event?.message;
         console.log('[event]', {
@@ -1464,6 +1632,7 @@ async function main() {
           chatType: message?.chat_type,
           messageType: message?.message_type,
           messageId: message?.message_id,
+          referencedMessageId: getReferencedMessageId(event),
           rootId: message?.root_id || null,
           parentId: message?.parent_id || null,
           threadId: message?.thread_id || null,
@@ -1485,6 +1654,17 @@ async function main() {
           return;
         }
 
+        const incomingMessageId = getMessageId(event);
+        const chatKey = getChatKey(event);
+        if (store.hasProcessedMessage(chatKey, incomingMessageId)) {
+          console.log('[dedupe-skip]', {
+            chatId: message.chat_id,
+            messageId: incomingMessageId
+          });
+          return;
+        }
+        await store.registerProcessedMessage(chatKey, incomingMessageId);
+
         const rawText = getTextContent(message.content);
         console.log('[message]', {
           chatId: message.chat_id,
@@ -1496,17 +1676,50 @@ async function main() {
         const normalizedText = cleanPromptText(rawText, event) || rawText;
         const isGroup = isGroupChat(event);
         const mentioned = isBotMentioned(event);
-        const chatKey = getChatKey(event);
+        const threadMarkers = getThreadMarkers(event);
         const threadSession = resolveSessionFromThread(chatKey, event);
 
         if (isGroup && !threadSession && !mentioned) {
+          if (threadMarkers.length) {
+            await sendTextMessage(
+              client,
+              message.chat_id,
+              '这个话题原来对应的会话已经不存在了。请发送 `/new ...` 新建会话，或者回到主面板用 `S1:` 这样的显式路由继续。'
+            );
+          }
           return;
+        }
+
+        const requiresReferencedContext = normalizedText.toLowerCase().startsWith('/new');
+        if (normalizedText.startsWith('/') && !requiresReferencedContext) {
+          if (await handleCommand(client, event, normalizedText)) {
+            return;
+          }
+        }
+
+        const referencedMessage = await fetchReferencedMessage(client, event);
+        if (referencedMessage?.text) {
+          console.log('[quoted-message]', {
+            chatId: message.chat_id,
+            messageId: message.message_id,
+            referencedMessageId: referencedMessage.messageId,
+            attachments: referencedMessage.attachments?.map((item) => item.path) || [],
+            preview: trimPreview(referencedMessage.text, 120)
+          });
+        } else if (referencedMessage?.attachments?.length) {
+          console.log('[quoted-message]', {
+            chatId: message.chat_id,
+            messageId: message.message_id,
+            referencedMessageId: referencedMessage.messageId,
+            attachments: referencedMessage.attachments.map((item) => item.path),
+            preview: '(附件引用，无文本正文)'
+          });
         }
 
         const attachmentMessages = ['image', 'file', 'post'].includes(message.message_type)
           ? await downloadMessageAttachment(client, event)
           : [];
-        if (!rawText && !attachmentMessages.length) {
+        if (!normalizedText && !attachmentMessages.length && !referencedMessage?.text && !referencedMessage?.attachments?.length) {
           await sendTextMessage(client, message.chat_id, '没有解析到可处理的文本或附件内容。');
           return;
         }
@@ -1518,23 +1731,24 @@ async function main() {
         }
 
         if (isGroup && mentioned && normalizedText.startsWith('/')) {
-          if (await handleCommand(client, event, normalizedText)) {
+          if (await handleCommand(client, event, normalizedText, { referencedMessage })) {
             return;
           }
         }
 
-        if (await handleCommand(client, event, normalizedText)) {
+        if (await handleCommand(client, event, normalizedText, { referencedMessage })) {
           return;
         }
 
+        const quotedText = buildReferencedMessagePrompt(referencedMessage, normalizedText);
         const cleanedText = attachmentMessages.length
-          ? buildAttachmentPrompt(attachmentMessages, normalizedText)
-          : normalizedText;
+          ? buildAttachmentPrompt(attachmentMessages, quotedText)
+          : quotedText;
         console.log('[route]', {
           chatId: chatKey,
           isGroup,
           mentioned,
-          markers: getThreadMarkers(event),
+          markers: threadMarkers,
           threadSession: threadSession?.alias || null,
           activeAlias: store.get(chatKey).activeAlias || null
         });
@@ -1618,21 +1832,23 @@ async function main() {
         }
 
         void queueTurn(client, event, prompt, alias);
-      } catch (error) {
-        const event = payload.event ?? payload;
-        const message = event?.message;
-        await logRuntime('message-handler-failed', {
-          chatId: message?.chat_id || '',
-          rawContent: message?.content || '',
-          error: {
-            message: error?.message || '未知错误',
-            stack: error?.stack || ''
-          }
-        });
-        if (message?.chat_id) {
-          await sendTextMessage(client, message.chat_id, '机器人处理这条消息时出了点问题。我已经把错误记到日志里了，你可以稍后重试一次。');
         }
-      }
+        catch (error) {
+          const event = payload.event ?? payload;
+          const message = event?.message;
+          await logRuntime('message-handler-failed', {
+            chatId: message?.chat_id || '',
+            rawContent: message?.content || '',
+            error: {
+              message: error?.message || '未知错误',
+              stack: error?.stack || ''
+            }
+          });
+          if (message?.chat_id) {
+            await sendTextMessage(client, message.chat_id, '机器人处理这条消息时出了点问题。我已经把错误记到日志里了，你可以稍后重试一次。');
+          }
+        }
+      })();
     }
   });
 

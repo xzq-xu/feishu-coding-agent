@@ -49,6 +49,7 @@ function normalizeChatRecord(chatKey, record) {
       chatKey,
       activeAlias: null,
       nextSessionNumber: 1,
+      processedMessageIds: [],
       sessions: {}
     };
   }
@@ -58,6 +59,7 @@ function normalizeChatRecord(chatKey, record) {
       chatKey,
       activeAlias: 'S1',
       nextSessionNumber: 2,
+      processedMessageIds: [],
       sessions: {
         S1: normalizeSession('S1', {
           sessionId: record.sessionId || null,
@@ -83,6 +85,9 @@ function normalizeChatRecord(chatKey, record) {
     chatKey,
     activeAlias: record.activeAlias && sessions[record.activeAlias] ? record.activeAlias : null,
     nextSessionNumber,
+    processedMessageIds: Array.isArray(record.processedMessageIds)
+      ? record.processedMessageIds.filter((id) => typeof id === 'string' && id).slice(-200)
+      : [],
     sessions
   };
 }
@@ -137,6 +142,28 @@ export class SessionStore {
   getSession(chatKey, alias) {
     const record = this.get(chatKey);
     return record.sessions[alias] || null;
+  }
+
+  hasProcessedMessage(chatKey, messageId) {
+    if (!messageId) {
+      return false;
+    }
+    const record = this.get(chatKey);
+    return record.processedMessageIds.includes(messageId);
+  }
+
+  async registerProcessedMessage(chatKey, messageId) {
+    if (!messageId) {
+      return;
+    }
+    const record = this.get(chatKey);
+    if (!record.processedMessageIds.includes(messageId)) {
+      record.processedMessageIds.push(messageId);
+      if (record.processedMessageIds.length > 200) {
+        record.processedMessageIds = record.processedMessageIds.slice(-200);
+      }
+      await this.flush();
+    }
   }
 
   findSessionByThreadMarker(chatKey, marker) {
