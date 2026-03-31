@@ -14,6 +14,9 @@ const activeProcesses = new Map();
 const stopRequests = new Set();
 const runtimeLogPath = path.join(config.dataDir, 'runtime.log');
 const RECENT_SESSION_LIMIT = 5;
+const botIdentity = {
+  names: new Set()
+};
 
 function getJobKey(chatKey, alias) {
   return `${chatKey}::${alias}`;
@@ -159,7 +162,11 @@ function formatRecentSessions(chatKey) {
   return lines.join('\n');
 }
 
-function buildResultCard({ chatKey, alias, output, sessionId, workspace, status = 'idle', provider = 'codex', branchChange = null, commitChange = null, title = 'Agent 结果' }) {
+function getChatSourceLabel(event) {
+  return isGroupChat(event) ? '群聊' : '私聊';
+}
+
+function buildResultCard({ chatKey, alias, output, sessionId, workspace, status = 'idle', provider = 'codex', branchChange = null, commitChange = null, title = 'Agent 结果', sourceLabel = '' }) {
   const record = store.get(chatKey);
   const sessionCount = store.listSessions(chatKey).length;
   const elements = [
@@ -175,6 +182,7 @@ function buildResultCard({ chatKey, alias, output, sessionId, workspace, status 
       content: [
         `**会话**: ${alias}`,
         `**Agent**: ${getProviderLabel(provider)}`,
+        sourceLabel ? `**来源**: ${sourceLabel}` : null,
         `**状态**: ${getStatusLabel(status)}`,
         branchChange ? `**分支变化**: ${branchChange.before} -> ${branchChange.after}` : null,
         commitChange ? `**提交变化**: ${commitChange.before.slice(0, 7)} -> ${commitChange.after.slice(0, 7)}` : null,
@@ -211,7 +219,7 @@ function buildResultCard({ chatKey, alias, output, sessionId, workspace, status 
       template: 'blue',
       title: {
         tag: 'plain_text',
-        content: title
+        content: sourceLabel ? `${title} · ${sourceLabel}` : title
       }
     },
     elements
@@ -347,7 +355,34 @@ async function parseNewCommand(command) {
 function getTextContent(content) {
   try {
     const parsed = JSON.parse(content || '{}');
-    return typeof parsed.text === 'string' ? parsed.text.trim() : '';
+    if (typeof parsed.text === 'string') {
+      return parsed.text.trim();
+    }
+
+    const localeBlock = parsed.zh_cn || parsed.en_us || parsed;
+    const lines = Array.isArray(localeBlock?.content) ? localeBlock.content : [];
+    const text = lines
+      .flat()
+      .map((item) => {
+        if (!item || typeof item !== 'object') {
+          return '';
+        }
+        if (typeof item.text === 'string') {
+          return item.text;
+        }
+        if (typeof item.href === 'string') {
+          return item.href;
+        }
+        if (typeof item.un_escape === 'string') {
+          return item.un_escape;
+        }
+        return '';
+      })
+      .filter(Boolean)
+      .join(' ')
+      .trim();
+
+    return text;
   } catch {
     return '';
   }
@@ -357,8 +392,54 @@ function getChatKey(event) {
   return event.message.chat_id;
 }
 
+function isGroupChat(event) {
+  return event?.message?.chat_type === 'group';
+}
+
 function getSenderOpenId(event) {
   return event.sender?.sender_id?.open_id || '';
+}
+
+function getMentions(event) {
+  return Array.isArray(event?.message?.mentions) ? event.message.mentions : [];
+}
+
+function normalizeMentionName(value) {
+  return (value || '').trim().replace(/^@+/, '').toLowerCase();
+}
+
+function getMentionCandidates(mention) {
+  return [
+    mention?.name,
+    mention?.key,
+    mention?.text,
+    mention?.id?.open_id,
+    mention?.id?.user_id,
+    mention?.id?.union_id,
+    mention?.open_id,
+    mention?.user_id,
+    mention?.union_id
+  ].map(normalizeMentionName).filter(Boolean);
+}
+
+function getMentionSummaries(event) {
+  return getMentions(event).map((mention) => ({
+    name: mention?.name || null,
+    key: mention?.key || null,
+    text: mention?.text || null,
+    openId: mention?.id?.open_id || mention?.open_id || null,
+    userId: mention?.id?.user_id || mention?.user_id || null,
+    unionId: mention?.id?.union_id || mention?.union_id || null
+  }));
+}
+
+function isBotMentioned(event) {
+  const mentions = getMentions(event);
+  if (!mentions.length) {
+    return false;
+  }
+
+  return mentions.some((mention) => getMentionCandidates(mention).some((candidate) => botIdentity.names.has(candidate)));
 }
 
 function getThreadMarkers(event) {
@@ -372,6 +453,116 @@ function getThreadMarkers(event) {
 
 function getMessageId(event) {
   return event?.message?.message_id || null;
+}
+
+function cleanPromptText(text, event) {
+  let cleaned = (text || '').trim();
+  for (const mention of getMentions(event)) {
+    for (const token of [mention?.name, mention?.key, mention?.text].filter(Boolean)) {
+      const rawToken = String(token);
+      const withAt = rawToken.startsWith('@') ? rawToken : `@${rawToken}`;
+      cleaned = cleaned.replaceAll(withAt, '').trim();
+    }
+  }
+  return cleaned;
+}
+
+function extractMessageBodyText(item) {
+  if (!item) {
+    return '';
+  }
+  const raw = item.body?.content || item.content || item.message?.content || '';
+  return getTextContent(raw);
+}
+
+function getMessageThreadMarkers(item) {
+  return [
+    item?.root_id || item?.message?.root_id || null,
+    item?.parent_id || item?.message?.parent_id || null,
+    item?.thread_id || item?.message?.thread_id || null,
+    item?.message_id || item?.message?.message_id || null
+  ].filter(Boolean);
+}
+
+function buildGroupContextPrompt(messages, currentText) {
+  if (!messages.length) {
+    return currentText;
+  }
+
+  const lines = messages
+    .map((item, index) => {
+      const text = extractMessageBodyText(item);
+      if (!text) {
+        return null;
+      }
+      const senderType = item?.sender?.sender_type || item?.sender_type || 'user';
+      const label = senderType === 'app' ? '机器人' : `群消息${index + 1}`;
+      return `${label}: ${text}`;
+    })
+    .filter(Boolean);
+
+  if (!lines.length) {
+    return currentText;
+  }
+
+  return [
+    '以下是这条群聊任务最近的上下文消息，请把它们当作任务背景，只处理最后这条用户指令。',
+    '',
+    lines.join('\n'),
+    '',
+    `当前用户指令: ${currentText}`
+  ].join('\n');
+}
+
+function formatGroupNewCommandHint() {
+  return [
+    '群聊里顶层消息请用 `@机器人 + 指令` 的格式。',
+    '',
+    '可用指令：',
+    '`@机器人 /new codex /Users/xzq/project-a 帮我排查这个报错`',
+    '`@机器人 /new cursor /Users/xzq/project-b 帮我检查这个仓库的 TODO`',
+    '`@机器人 /thread S1`',
+    '`@机器人 /sessions`',
+    '`@机器人 /status`',
+    '',
+    '其中只有 `/new` 必须指定工作目录。创建成功后，后续都只在这个话题里继续，不需要再 @。'
+  ].join('\n');
+}
+
+async function fetchRecentGroupContext(client, event, limit = 12) {
+  const message = event?.message;
+  if (!message?.chat_id) {
+    return [];
+  }
+
+  try {
+    const response = await client.im.v1.message.list({
+      params: {
+        container_id_type: 'chat',
+        container_id: message.chat_id,
+        sort_type: 'ByCreateTimeDesc',
+        page_size: limit
+      }
+    });
+
+    let items = response?.data?.items || [];
+    const markers = new Set(getThreadMarkers(event));
+    if (markers.size) {
+      const threaded = items.filter((item) => getMessageThreadMarkers(item).some((marker) => markers.has(marker)));
+      if (threaded.length) {
+        items = threaded;
+      }
+    }
+
+    return items.reverse();
+  } catch (error) {
+    await logRuntime('group-context-fetch-failed', {
+      chatId: message.chat_id,
+      messageId: message.message_id || '',
+      error: error?.message || '未知错误'
+    });
+    return [];
+  }
 }
 
 function formatHelp() {
@@ -578,6 +769,17 @@ async function ensureSessionRootMessage(client, event, chatKey, session, options
   return rootMessageId;
 }
 
+async function registerCurrentMessageToSession(chatKey, alias, event) {
+  const messageId = getMessageId(event);
+  if (messageId) {
+    await store.registerMessageId(chatKey, alias, messageId);
+  }
+  const markers = getThreadMarkers(event);
+  for (const marker of markers) {
+    await store.registerThreadId(chatKey, alias, marker);
+  }
+}
+
 function resolveSessionFromThread(chatKey, event) {
   const markers = getThreadMarkers(event);
   for (const marker of markers) {
@@ -658,6 +860,7 @@ async function handleCommand(client, event, text) {
   if (command.toLowerCase() === '/thread') {
     const threadSession = resolveSessionFromThread(chatKey, event);
     const session = threadSession || await store.ensureActiveSession(chatKey);
+    await registerCurrentMessageToSession(chatKey, session.alias, event);
     await ensureSessionRootMessage(client, event, chatKey, session, { forceNew: true, promptQueued: false });
     return true;
   }
@@ -670,6 +873,7 @@ async function handleCommand(client, event, text) {
       await sendTextMessage(client, event.message.chat_id, `没有找到 ${alias}。发送 /sessions 看最近会话。`);
       return true;
     }
+    await registerCurrentMessageToSession(chatKey, alias, event);
     await ensureSessionRootMessage(client, event, chatKey, session, { forceNew: true, promptQueued: false });
     return true;
   }
@@ -948,6 +1152,7 @@ async function queueTurn(client, event, prompt, alias) {
         workspace,
         status: 'success',
         provider,
+        sourceLabel: getChatSourceLabel(event),
         branchChange: diff.branchChange,
         commitChange: diff.commitChange,
         title: `${getProviderLabel(provider)} 结果`
@@ -1026,6 +1231,32 @@ async function main() {
     appSecret: config.feishuAppSecret
   });
 
+  try {
+    const appInfo = await client.application.v6.application.get({
+      path: {
+        app_id: config.feishuAppId
+      },
+      params: {
+        lang: 'zh_cn'
+      }
+    });
+    const app = appInfo?.data?.app;
+    const names = [
+      app?.app_name,
+      ...(Array.isArray(app?.i18n) ? app.i18n.map((item) => item?.name) : [])
+    ]
+      .map(normalizeMentionName)
+      .filter(Boolean);
+    names.forEach((name) => botIdentity.names.add(name));
+    console.log('[bot-identity]', {
+      names
+    });
+  } catch (error) {
+    await logRuntime('bot-identity-init-failed', {
+      error: error?.message || '未知错误'
+    });
+  }
+
   const dispatcher = new Lark.EventDispatcher({}).register({
     'im.message.receive_v1': async (payload) => {
       try {
@@ -1040,6 +1271,7 @@ async function main() {
           rootId: message?.root_id || null,
           parentId: message?.parent_id || null,
           threadId: message?.thread_id || null,
+          mentions: getMentionSummaries(event),
           senderOpenId: getSenderOpenId(event)
         });
 
@@ -1047,8 +1279,8 @@ async function main() {
           return;
         }
 
-        if (message.message_type !== 'text') {
-          await sendTextMessage(client, message.chat_id, '当前 MVP 只支持文本消息。');
+        if (!['text', 'post'].includes(message.message_type)) {
+          await sendTextMessage(client, message.chat_id, '当前 MVP 目前只支持文本和富文本消息。');
           return;
         }
 
@@ -1057,26 +1289,39 @@ async function main() {
           return;
         }
 
-        const text = getTextContent(message.content);
-        console.log('[message]', { chatId: message.chat_id, text });
-        if (!text) {
+        const rawText = getTextContent(message.content);
+        console.log('[message]', { chatId: message.chat_id, text: rawText });
+        if (!rawText) {
           await sendTextMessage(client, message.chat_id, '没有解析到文本内容，请直接发送文本消息。');
           return;
         }
 
-        if (await handleCommand(client, event, text)) {
+        const normalizedText = cleanPromptText(rawText, event) || rawText;
+        const isGroup = isGroupChat(event);
+        const mentioned = isBotMentioned(event);
+
+        if (isGroup && mentioned && normalizedText.startsWith('/')) {
+          if (await handleCommand(client, event, normalizedText)) {
+            return;
+          }
+        }
+
+        if (await handleCommand(client, event, normalizedText)) {
           return;
         }
 
         const chatKey = getChatKey(event);
         const threadSession = resolveSessionFromThread(chatKey, event);
+        const cleanedText = normalizedText;
         console.log('[route]', {
           chatId: chatKey,
+          isGroup,
+          mentioned,
           markers: getThreadMarkers(event),
           threadSession: threadSession?.alias || null,
           activeAlias: store.get(chatKey).activeAlias || null
         });
-        const prefixed = parseSessionPrefixedPrompt(text);
+        const prefixed = parseSessionPrefixedPrompt(normalizedText);
         let alias;
         let prompt;
 
@@ -1089,6 +1334,56 @@ async function main() {
             return;
           }
         } else {
+          if (isGroup && !threadSession && !mentioned) {
+            return;
+          }
+
+          if (isGroup && threadSession) {
+            alias = threadSession.alias;
+            prompt = cleanedText;
+          } else if (isGroup && mentioned) {
+            if (!cleanedText.toLowerCase().startsWith('/new')) {
+              await sendTextMessage(client, message.chat_id, formatGroupNewCommandHint(), getMessageId(event) || null);
+              return;
+            }
+
+            const parsed = await parseNewCommand(cleanedText);
+            if (!parsed.workspace) {
+              await sendTextMessage(
+                client,
+                message.chat_id,
+                [
+                  '群聊里创建任务时必须指定工作目录。',
+                  '',
+                  '示例：',
+                  '`@机器人 /new codex /Users/xzq/project-a 帮我排查这个报错`'
+                ].join('\n'),
+                getMessageId(event) || null
+              );
+              return;
+            }
+
+            const session = await store.createSession(chatKey);
+            alias = session.alias;
+            if (parsed.provider) {
+              await store.updateSession(chatKey, alias, {
+                provider: parsed.provider,
+                sessionId: null,
+                status: 'idle',
+                currentTaskPreview: ''
+              });
+              session.provider = parsed.provider;
+            }
+            await store.updateSession(chatKey, alias, { workspace: parsed.workspace });
+            session.workspace = parsed.workspace;
+            const incomingMessageId = getMessageId(event);
+            if (incomingMessageId) {
+              await store.updateSession(chatKey, alias, { rootMessageId: incomingMessageId });
+              await store.registerMessageId(chatKey, alias, incomingMessageId);
+            }
+            const recentMessages = await fetchRecentGroupContext(client, event, 12);
+            prompt = buildGroupContextPrompt(recentMessages, parsed.prompt || '');
+          } else {
           const sessions = store.listSessions(chatKey);
           if (!threadSession && sessions.length > 1) {
             await sendTextMessage(
@@ -1102,6 +1397,7 @@ async function main() {
           const target = threadSession || await store.ensureActiveSession(chatKey);
           alias = target.alias;
           prompt = text;
+          }
         }
 
         if (!prompt) {
