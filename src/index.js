@@ -16,12 +16,14 @@ const stopRequests = new Set();
 const runtimeLogPath = path.join(config.dataDir, 'runtime.log');
 const RECENT_SESSION_LIMIT = 5;
 const REFERENCED_MESSAGE_KEYS = ['quote_message_id', 'upper_message_id', 'reply_message_id', 'source_message_id'];
+const MESSAGE_BATCH_WINDOW_MS = 1500;
 const botIdentity = {
   names: new Set()
 };
 let cleanupPromise = Promise.resolve();
 let processLockHandle = null;
 let shutdownStarted = false;
+const pendingMessageBatches = new Map();
 
 function getJobKey(chatKey, alias) {
   return `${chatKey}::${alias}`;
@@ -415,6 +417,19 @@ function isGroupChat(event) {
 
 function getSenderOpenId(event) {
   return event.sender?.sender_id?.open_id || '';
+}
+
+function getMessageBatchThreadKey(event) {
+  const message = event?.message;
+  return message?.thread_id || message?.root_id || message?.parent_id || 'main';
+}
+
+function getMessageBatchKey(event) {
+  return [
+    getChatKey(event),
+    getSenderOpenId(event) || 'unknown',
+    getMessageBatchThreadKey(event)
+  ].join('::');
 }
 
 function getMentions(event) {
@@ -832,6 +847,48 @@ function buildAttachmentPrompt(attachments, text = '') {
     '附件已下载到本地，请直接使用这些绝对路径：',
     ...lines
   ].join('\n');
+}
+
+function selectPrimaryEvent(events) {
+  const reversed = [...events].reverse();
+  return reversed.find((event) => {
+    const rawText = getTextContent(event?.message?.content);
+    const normalizedText = cleanPromptText(rawText, event) || rawText;
+    return Boolean(normalizedText.trim());
+  }) || events[events.length - 1];
+}
+
+function aggregateBatchText(events, primaryEvent) {
+  const primaryRawText = getTextContent(primaryEvent?.message?.content);
+  const primaryText = (cleanPromptText(primaryRawText, primaryEvent) || primaryRawText || '').trim();
+  if (!primaryText) {
+    return '';
+  }
+  if (primaryText.startsWith('/')) {
+    return primaryText;
+  }
+
+  const allTexts = events
+    .map((event) => {
+      const rawText = getTextContent(event?.message?.content);
+      return (cleanPromptText(rawText, event) || rawText || '').trim();
+    })
+    .filter(Boolean);
+
+  return allTexts.join('\n').trim();
+}
+
+async function collectBatchAttachments(client, events) {
+  const attachments = [];
+  for (const event of events) {
+    const messageType = event?.message?.message_type;
+    if (!['image', 'file', 'post'].includes(messageType)) {
+      continue;
+    }
+    const downloaded = await downloadMessageAttachment(client, event);
+    attachments.push(...downloaded);
+  }
+  return attachments;
 }
 
 function getMessageThreadMarkers(item) {
@@ -1587,6 +1644,208 @@ async function queueTurn(client, event, prompt, alias) {
   await next;
 }
 
+async function processIncomingBatch(client, events) {
+  const primaryEvent = selectPrimaryEvent(events);
+  const message = primaryEvent?.message;
+  if (!message) {
+    return;
+  }
+
+  const chatKey = getChatKey(primaryEvent);
+  const rawText = aggregateBatchText(events, primaryEvent);
+  console.log('[message]', {
+    chatId: message.chat_id,
+    text: rawText,
+    attachments: [],
+    batchSize: events.length,
+    content: rawText ? undefined : message.content
+  });
+
+  const normalizedText = cleanPromptText(rawText, primaryEvent) || rawText;
+  const isGroup = isGroupChat(primaryEvent);
+  const mentioned = isBotMentioned(primaryEvent);
+  const threadMarkers = getThreadMarkers(primaryEvent);
+  const threadSession = resolveSessionFromThread(chatKey, primaryEvent);
+
+  if (isGroup && !threadSession && !mentioned) {
+    if (threadMarkers.length) {
+      await sendTextMessage(
+        client,
+        message.chat_id,
+        '这个话题原来对应的会话已经不存在了。请发送 `/new ...` 新建会话，或者回到主面板用 `S1:` 这样的显式路由继续。'
+      );
+    }
+    return;
+  }
+
+  const requiresReferencedContext = normalizedText.toLowerCase().startsWith('/new');
+  if (normalizedText.startsWith('/') && !requiresReferencedContext) {
+    if (await handleCommand(client, primaryEvent, normalizedText)) {
+      return;
+    }
+  }
+
+  const referencedMessage = await fetchReferencedMessage(client, primaryEvent);
+  if (referencedMessage?.text) {
+    console.log('[quoted-message]', {
+      chatId: message.chat_id,
+      messageId: message.message_id,
+      referencedMessageId: referencedMessage.messageId,
+      attachments: referencedMessage.attachments?.map((item) => item.path) || [],
+      preview: trimPreview(referencedMessage.text, 120)
+    });
+  } else if (referencedMessage?.attachments?.length) {
+    console.log('[quoted-message]', {
+      chatId: message.chat_id,
+      messageId: message.message_id,
+      referencedMessageId: referencedMessage.messageId,
+      attachments: referencedMessage.attachments.map((item) => item.path),
+      preview: '(附件引用，无文本正文)'
+    });
+  }
+
+  const attachmentMessages = await collectBatchAttachments(client, events);
+  if (!normalizedText && !attachmentMessages.length && !referencedMessage?.text && !referencedMessage?.attachments?.length) {
+    await sendTextMessage(client, message.chat_id, '没有解析到可处理的文本或附件内容。');
+    return;
+  }
+  if (attachmentMessages.length) {
+    console.log('[attachments]', {
+      chatId: message.chat_id,
+      files: attachmentMessages.map((item) => item.path),
+      batchSize: events.length
+    });
+  }
+
+  if (isGroup && mentioned && normalizedText.startsWith('/')) {
+    if (await handleCommand(client, primaryEvent, normalizedText, { referencedMessage })) {
+      return;
+    }
+  }
+
+  if (await handleCommand(client, primaryEvent, normalizedText, { referencedMessage })) {
+    return;
+  }
+
+  const quotedText = buildReferencedMessagePrompt(referencedMessage, normalizedText);
+  const cleanedText = attachmentMessages.length
+    ? buildAttachmentPrompt(attachmentMessages, quotedText)
+    : quotedText;
+  console.log('[route]', {
+    chatId: chatKey,
+    isGroup,
+    mentioned,
+    markers: threadMarkers,
+    threadSession: threadSession?.alias || null,
+    activeAlias: store.get(chatKey).activeAlias || null,
+    batchSize: events.length
+  });
+  const prefixed = parseSessionPrefixedPrompt(normalizedText);
+  let alias;
+  let prompt;
+
+  if (prefixed) {
+    alias = prefixed.alias;
+    prompt = prefixed.prompt;
+    const targetSession = store.getSession(chatKey, alias);
+    if (!targetSession) {
+      await sendTextMessage(client, message.chat_id, `没有找到 ${alias}。发送 /sessions 看最近会话，或 /new 新建一个。`);
+      return;
+    }
+  } else if (isGroup && threadSession) {
+    alias = threadSession.alias;
+    prompt = cleanedText;
+  } else if (isGroup && mentioned) {
+    if (!cleanedText.toLowerCase().startsWith('/new')) {
+      await sendTextMessage(client, message.chat_id, formatGroupNewCommandHint(), getMessageId(primaryEvent) || null);
+      return;
+    }
+
+    const parsed = await parseNewCommand(cleanedText);
+    if (!parsed.workspace) {
+      await sendTextMessage(
+        client,
+        message.chat_id,
+        [
+          '群聊里创建任务时必须指定工作目录。',
+          '',
+          '示例：',
+          '`@机器人 /new codex /Users/xzq/project-a 帮我排查这个报错`'
+        ].join('\n'),
+        getMessageId(primaryEvent) || null
+      );
+      return;
+    }
+
+    const session = await store.createSession(chatKey);
+    alias = session.alias;
+    if (parsed.provider) {
+      await store.updateSession(chatKey, alias, {
+        provider: parsed.provider,
+        sessionId: null,
+        status: 'idle',
+        currentTaskPreview: ''
+      });
+      session.provider = parsed.provider;
+    }
+    await store.updateSession(chatKey, alias, { workspace: parsed.workspace });
+    session.workspace = parsed.workspace;
+    const incomingMessageId = getMessageId(primaryEvent);
+    if (incomingMessageId) {
+      await store.updateSession(chatKey, alias, { rootMessageId: incomingMessageId });
+      await store.registerMessageId(chatKey, alias, incomingMessageId);
+    }
+    const recentMessages = await fetchRecentGroupContext(client, primaryEvent, 12);
+    prompt = buildGroupContextPrompt(recentMessages, parsed.prompt || '');
+  } else {
+    if (!threadSession) {
+      await sendTextMessage(client, message.chat_id, formatMainPanelHint(chatKey, isGroup));
+      return;
+    }
+
+    alias = threadSession.alias;
+    prompt = cleanedText;
+  }
+
+  if (!prompt) {
+    await sendTextMessage(client, message.chat_id, '没有解析到要发送给 Codex 的文本。');
+    return;
+  }
+
+  void queueTurn(client, primaryEvent, prompt, alias);
+}
+
+function enqueueIncomingEvent(client, event) {
+  const batchKey = getMessageBatchKey(event);
+  const existing = pendingMessageBatches.get(batchKey) || {
+    events: [],
+    timer: null
+  };
+  existing.events.push(event);
+  if (existing.timer) {
+    clearTimeout(existing.timer);
+  }
+  existing.timer = setTimeout(() => {
+    pendingMessageBatches.delete(batchKey);
+    void processIncomingBatch(client, existing.events).catch(async (error) => {
+      const message = existing.events[existing.events.length - 1]?.message;
+      await logRuntime('message-handler-failed', {
+        chatId: message?.chat_id || '',
+        rawContent: message?.content || '',
+        error: {
+          message: error?.message || '未知错误',
+          stack: error?.stack || ''
+        }
+      });
+      if (message?.chat_id) {
+        await sendTextMessage(client, message.chat_id, '机器人处理这条消息时出了点问题。我已经把错误记到日志里了，你可以稍后重试一次。');
+      }
+    });
+  }, MESSAGE_BATCH_WINDOW_MS);
+  existing.timer.unref?.();
+  pendingMessageBatches.set(batchKey, existing);
+}
+
 async function main() {
   processLockHandle = await acquireSingleInstanceLock(config.dataDir);
   await store.init();
@@ -1668,174 +1927,7 @@ async function main() {
           });
           return;
         }
-
-        const rawText = getTextContent(message.content);
-        console.log('[message]', {
-          chatId: message.chat_id,
-          text: rawText,
-          attachments: [],
-          content: rawText ? undefined : message.content
-        });
-
-        const normalizedText = cleanPromptText(rawText, event) || rawText;
-        const isGroup = isGroupChat(event);
-        const mentioned = isBotMentioned(event);
-        const threadMarkers = getThreadMarkers(event);
-        const threadSession = resolveSessionFromThread(chatKey, event);
-
-        if (isGroup && !threadSession && !mentioned) {
-          if (threadMarkers.length) {
-            await sendTextMessage(
-              client,
-              message.chat_id,
-              '这个话题原来对应的会话已经不存在了。请发送 `/new ...` 新建会话，或者回到主面板用 `S1:` 这样的显式路由继续。'
-            );
-          }
-          return;
-        }
-
-        const requiresReferencedContext = normalizedText.toLowerCase().startsWith('/new');
-        if (normalizedText.startsWith('/') && !requiresReferencedContext) {
-          if (await handleCommand(client, event, normalizedText)) {
-            return;
-          }
-        }
-
-        const referencedMessage = await fetchReferencedMessage(client, event);
-        if (referencedMessage?.text) {
-          console.log('[quoted-message]', {
-            chatId: message.chat_id,
-            messageId: message.message_id,
-            referencedMessageId: referencedMessage.messageId,
-            attachments: referencedMessage.attachments?.map((item) => item.path) || [],
-            preview: trimPreview(referencedMessage.text, 120)
-          });
-        } else if (referencedMessage?.attachments?.length) {
-          console.log('[quoted-message]', {
-            chatId: message.chat_id,
-            messageId: message.message_id,
-            referencedMessageId: referencedMessage.messageId,
-            attachments: referencedMessage.attachments.map((item) => item.path),
-            preview: '(附件引用，无文本正文)'
-          });
-        }
-
-        const attachmentMessages = ['image', 'file', 'post'].includes(message.message_type)
-          ? await downloadMessageAttachment(client, event)
-          : [];
-        if (!normalizedText && !attachmentMessages.length && !referencedMessage?.text && !referencedMessage?.attachments?.length) {
-          await sendTextMessage(client, message.chat_id, '没有解析到可处理的文本或附件内容。');
-          return;
-        }
-        if (attachmentMessages.length) {
-          console.log('[attachments]', {
-            chatId: message.chat_id,
-            files: attachmentMessages.map((item) => item.path)
-          });
-        }
-
-        if (isGroup && mentioned && normalizedText.startsWith('/')) {
-          if (await handleCommand(client, event, normalizedText, { referencedMessage })) {
-            return;
-          }
-        }
-
-        if (await handleCommand(client, event, normalizedText, { referencedMessage })) {
-          return;
-        }
-
-        const quotedText = buildReferencedMessagePrompt(referencedMessage, normalizedText);
-        const cleanedText = attachmentMessages.length
-          ? buildAttachmentPrompt(attachmentMessages, quotedText)
-          : quotedText;
-        console.log('[route]', {
-          chatId: chatKey,
-          isGroup,
-          mentioned,
-          markers: threadMarkers,
-          threadSession: threadSession?.alias || null,
-          activeAlias: store.get(chatKey).activeAlias || null
-        });
-        const prefixed = parseSessionPrefixedPrompt(normalizedText);
-        let alias;
-        let prompt;
-
-        if (prefixed) {
-          alias = prefixed.alias;
-          prompt = prefixed.prompt;
-          const targetSession = store.getSession(chatKey, alias);
-          if (!targetSession) {
-            await sendTextMessage(client, message.chat_id, `没有找到 ${alias}。发送 /sessions 看最近会话，或 /new 新建一个。`);
-            return;
-          }
-        } else {
-          if (isGroup && !threadSession && !mentioned) {
-            return;
-          }
-
-          if (isGroup && threadSession) {
-            alias = threadSession.alias;
-            prompt = cleanedText;
-          } else if (isGroup && mentioned) {
-            if (!cleanedText.toLowerCase().startsWith('/new')) {
-              await sendTextMessage(client, message.chat_id, formatGroupNewCommandHint(), getMessageId(event) || null);
-              return;
-            }
-
-            const parsed = await parseNewCommand(cleanedText);
-            if (!parsed.workspace) {
-              await sendTextMessage(
-                client,
-                message.chat_id,
-                [
-                  '群聊里创建任务时必须指定工作目录。',
-                  '',
-                  '示例：',
-                  '`@机器人 /new codex /Users/xzq/project-a 帮我排查这个报错`'
-                ].join('\n'),
-                getMessageId(event) || null
-              );
-              return;
-            }
-
-            const session = await store.createSession(chatKey);
-            alias = session.alias;
-            if (parsed.provider) {
-              await store.updateSession(chatKey, alias, {
-                provider: parsed.provider,
-                sessionId: null,
-                status: 'idle',
-                currentTaskPreview: ''
-              });
-              session.provider = parsed.provider;
-            }
-            await store.updateSession(chatKey, alias, { workspace: parsed.workspace });
-            session.workspace = parsed.workspace;
-            const incomingMessageId = getMessageId(event);
-            if (incomingMessageId) {
-              await store.updateSession(chatKey, alias, { rootMessageId: incomingMessageId });
-              await store.registerMessageId(chatKey, alias, incomingMessageId);
-            }
-            const recentMessages = await fetchRecentGroupContext(client, event, 12);
-            prompt = buildGroupContextPrompt(recentMessages, parsed.prompt || '');
-          } else {
-          if (!threadSession) {
-            await sendTextMessage(client, message.chat_id, formatMainPanelHint(chatKey, isGroup));
-            return;
-          }
-
-          const target = threadSession;
-          alias = target.alias;
-          prompt = cleanedText;
-          }
-        }
-
-        if (!prompt) {
-          await sendTextMessage(client, message.chat_id, '没有解析到要发送给 Codex 的文本。');
-          return;
-        }
-
-        void queueTurn(client, event, prompt, alias);
+        enqueueIncomingEvent(client, event);
         }
         catch (error) {
           const event = payload.event ?? payload;
