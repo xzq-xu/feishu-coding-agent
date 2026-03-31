@@ -716,11 +716,45 @@ function formatGroupNewCommandHint() {
     '可用指令：',
     '`@机器人 /new codex /Users/xzq/project-a 帮我排查这个报错`',
     '`@机器人 /new cursor /Users/xzq/project-b 帮我检查这个仓库的 TODO`',
-    '`@机器人 /thread S1`',
     '`@机器人 /sessions`',
     '`@机器人 /status`',
     '',
     '其中只有 `/new` 必须指定工作目录。创建成功后，后续都只在这个话题里继续，不需要再 @。'
+  ].join('\n');
+}
+
+function formatMainPanelHint(chatKey, isGroup) {
+  const commands = isGroup
+    ? [
+        '`@机器人 /new codex /Users/xzq/project-a 帮我排查这个报错`',
+        '`@机器人 /sessions`',
+        '`@机器人 /status`',
+        '`@机器人 S1: 帮我继续这个会话`'
+      ]
+    : [
+        '`/new codex /Users/xzq/project-a 帮我排查这个报错`',
+        '`/sessions`',
+        '`/status`',
+        '`S1: 帮我继续这个会话`'
+      ];
+
+  const header = isGroup
+    ? '群聊主面板只接受 `@机器人 + 命令`，不直接承接任务正文。'
+    : '私聊主面板只接受命令，不直接承接任务正文。';
+
+  return [
+    header,
+    '',
+    '你可以用：',
+    ...commands,
+    '',
+    '当前状态：',
+    formatStatus(chatKey),
+    '',
+    '最近会话：',
+    formatRecentSessions(chatKey).replace(/^最近会话:\s*/, ''),
+    '',
+    '真正的任务内容，请去对应 session 的话题里继续回复；如果你就在主面板，也可以用 `S1:` 这种显式路由继续。'
   ].join('\n');
 }
 
@@ -765,14 +799,12 @@ function formatHelp() {
     'Codex 飞书机器人已就绪。',
     '',
     '直接发送文本：发给当前活跃会话',
-    'S1: 继续优化这个方案：把消息发给指定会话',
+    'S1: 继续优化这个方案：把消息显式发给指定会话',
     '/agent：查看当前活跃会话使用的 Agent',
     '/new：创建一个新的会话，并设为当前活跃',
     '/new cursor：创建一个使用 Cursor Agent 的新会话',
     '/new cursor /path/to/project：创建新会话并同时指定 Agent 和目录',
     '/new cursor /path/to/project 你的第一条指令：创建新会话并立即开始',
-    '/thread：为当前会话创建或刷新一个话题入口',
-    '/thread S1：为指定会话创建或刷新一个话题入口',
     '/cwd：查看当前活跃会话的工作目录',
     '/cwd /path/to/project：修改当前活跃会话的工作目录',
     '/cwd S1 /path/to/project：修改指定会话的工作目录',
@@ -797,7 +829,6 @@ function formatUnknownCommand(command) {
     '',
     '可用命令:',
     '/new',
-    '/thread',
     '/cwd',
     '/stop',
     '/delete',
@@ -964,17 +995,6 @@ async function ensureSessionRootMessage(client, event, chatKey, session, options
   return rootMessageId;
 }
 
-async function registerCurrentMessageToSession(chatKey, alias, event) {
-  const messageId = getMessageId(event);
-  if (messageId) {
-    await store.registerMessageId(chatKey, alias, messageId);
-  }
-  const markers = getThreadMarkers(event);
-  for (const marker of markers) {
-    await store.registerThreadId(chatKey, alias, marker);
-  }
-}
-
 function resolveSessionFromThread(chatKey, event) {
   const markers = getThreadMarkers(event);
   for (const marker of markers) {
@@ -1049,27 +1069,6 @@ async function handleCommand(client, event, text) {
     }
 
     await ensureSessionRootMessage(client, event, chatKey, session, { promptQueued: false });
-    return true;
-  }
-
-  if (command.toLowerCase() === '/thread') {
-    const threadSession = resolveSessionFromThread(chatKey, event);
-    const session = threadSession || await store.ensureActiveSession(chatKey);
-    await registerCurrentMessageToSession(chatKey, session.alias, event);
-    await ensureSessionRootMessage(client, event, chatKey, session, { forceNew: true, promptQueued: false });
-    return true;
-  }
-
-  const threadMatch = command.match(/^\/thread\s+(S\d+)$/i);
-  if (threadMatch) {
-    const alias = threadMatch[1].toUpperCase();
-    const session = store.getSession(chatKey, alias);
-    if (!session) {
-      await sendTextMessage(client, event.message.chat_id, `没有找到 ${alias}。发送 /sessions 看最近会话。`);
-      return true;
-    }
-    await registerCurrentMessageToSession(chatKey, alias, event);
-    await ensureSessionRootMessage(client, event, chatKey, session, { forceNew: true, promptQueued: false });
     return true;
   }
 
@@ -1602,17 +1601,12 @@ async function main() {
             const recentMessages = await fetchRecentGroupContext(client, event, 12);
             prompt = buildGroupContextPrompt(recentMessages, parsed.prompt || '');
           } else {
-          const sessions = store.listSessions(chatKey);
-          if (!threadSession && sessions.length > 1) {
-            await sendTextMessage(
-              client,
-              message.chat_id,
-              '这条消息没有识别到对应的话题上下文。为了避免串到别的会话，请直接回复对应线程里的消息，或使用 `S1: 你的指令` 这种写法。'
-            );
+          if (!threadSession) {
+            await sendTextMessage(client, message.chat_id, formatMainPanelHint(chatKey, isGroup));
             return;
           }
 
-          const target = threadSession || await store.ensureActiveSession(chatKey);
+          const target = threadSession;
           alias = target.alias;
           prompt = cleanedText;
           }

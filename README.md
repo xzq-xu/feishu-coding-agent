@@ -27,8 +27,6 @@
 - `/new cursor /path/to/project` 创建新会话并同时指定 Agent 和工作目录
 - `/new /path/to/project 你的第一条指令` 创建新会话、指定目录并立即开始第一轮
 - `/new cursor /path/to/project 你的第一条指令` 创建新会话、指定 Agent、指定目录并立即开始第一轮
-- `/thread` 为当前会话创建或刷新一个话题入口
-- `/thread S1` 为指定旧会话创建或刷新一个话题入口
 - `/agent` 查看当前活跃会话使用的 Agent
 - `/cwd` 查看当前活跃会话的工作目录
 - `/cwd /path/to/project` 修改当前活跃会话的工作目录
@@ -182,14 +180,6 @@ npm start
 ```text
 /new cursor /Users/xzq/project-a 帮我分析这个仓库的测试失败原因
 ```
-
-如果你想让旧会话也进入话题模式：
-
-```text
-/thread S1
-```
-
-这会为旧会话补发一条新的主消息，之后这个会话的结果会回复到这条消息下面。
 
 如果你想切换当前会话的工作目录：
 
