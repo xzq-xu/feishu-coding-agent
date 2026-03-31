@@ -18,6 +18,14 @@ async function runGit(args, cwd) {
   return stdout;
 }
 
+async function runGitSafe(args, cwd) {
+  try {
+    return (await runGit(args, cwd)).trim();
+  } catch {
+    return '';
+  }
+}
+
 async function computeFileHash(filePath) {
   const data = await fs.readFile(filePath);
   return createHash('sha1').update(data).digest('hex');
@@ -38,17 +46,21 @@ function parsePorcelainLine(line) {
 }
 
 export async function captureWorkspaceSnapshot(workspace) {
-  try {
-    await runGit(['rev-parse', '--show-toplevel'], workspace);
-  } catch {
+  const topLevel = await runGitSafe(['rev-parse', '--show-toplevel'], workspace);
+  if (!topLevel) {
     return {
       supported: false,
       workspace,
+      topLevel: '',
+      branch: '',
+      head: '',
       changed: {}
     };
   }
 
   const statusOutput = await runGit(['status', '--porcelain=v1', '--untracked-files=all'], workspace);
+  const branch = await runGitSafe(['branch', '--show-current'], workspace);
+  const head = await runGitSafe(['rev-parse', 'HEAD'], workspace);
   const entries = statusOutput
     .split('\n')
     .map(parsePorcelainLine)
@@ -68,20 +80,14 @@ export async function captureWorkspaceSnapshot(workspace) {
   return {
     supported: true,
     workspace,
+    topLevel,
+    branch,
+    head,
     changed
   };
 }
 
-export async function summarizeWorkspaceChanges(before, after) {
-  if (!before?.supported || !after?.supported) {
-    return {
-      supported: false,
-      changedFiles: [],
-      summary: '当前工作目录不是 git 仓库，无法生成代码改动摘要。',
-      patch: ''
-    };
-  }
-
+function diffWorkingTree(before, after) {
   const allPaths = new Set([
     ...Object.keys(before.changed || {}),
     ...Object.keys(after.changed || {})
@@ -107,11 +113,84 @@ export async function summarizeWorkspaceChanges(before, after) {
     }
   }
 
+  return changedFiles;
+}
+
+async function summarizeCommittedChanges(before, after) {
+  if (!before.head || !after.head || before.head === after.head) {
+    return null;
+  }
+
+  const changedFilesOutput = await runGitSafe(['diff', '--name-only', before.head, after.head], after.workspace);
+  const changedFiles = changedFilesOutput
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const statOutput = await runGitSafe(['diff', '--stat', before.head, after.head], after.workspace);
+  const patchOutput = await runGitSafe(['diff', before.head, after.head], after.workspace);
+
+  const summaryLines = ['本轮代码改动:'];
+  if (before.branch !== after.branch) {
+    summaryLines.push(`- 分支: ${before.branch || '(detached)'} -> ${after.branch || '(detached)'}`);
+  }
+  summaryLines.push(`- 提交: ${before.head.slice(0, 7)} -> ${after.head.slice(0, 7)}`);
+
+  const fileLines = changedFiles.slice(0, 8).map((filePath) => `- ${filePath}`);
+  const extraCount = changedFiles.length - fileLines.length;
+  if (changedFiles.length) {
+    summaryLines.push(...fileLines);
+    if (extraCount > 0) {
+      summaryLines.push(`- 另有 ${extraCount} 个文件`);
+    }
+  } else {
+    summaryLines.push('- 提交点发生了变化，但净代码差异为空。');
+  }
+
+  if (statOutput) {
+    summaryLines.push('');
+    summaryLines.push(trimOutput(statOutput, 1200));
+  }
+
+  return {
+    supported: true,
+    changedFiles,
+    summary: summaryLines.join('\n'),
+    patch: trimOutput(patchOutput, 12000),
+    branchChange: before.branch !== after.branch
+      ? {
+          before: before.branch || '(detached)',
+          after: after.branch || '(detached)'
+        }
+      : null,
+    commitChange: {
+      before: before.head,
+      after: after.head
+    }
+  };
+}
+
+export async function summarizeWorkspaceChanges(before, after) {
+  if (!before?.supported || !after?.supported) {
+    return {
+      supported: false,
+      changedFiles: [],
+      summary: '当前工作目录不是 git 仓库，无法生成代码改动摘要。',
+      patch: ''
+    };
+  }
+
+  const committed = await summarizeCommittedChanges(before, after);
+  if (committed) {
+    return committed;
+  }
+
+  const changedFiles = diffWorkingTree(before, after);
   if (!changedFiles.length) {
     return {
       supported: true,
       changedFiles: [],
-      summary: '本轮没有检测到新的工作区改动。',
+      summary: '本轮没有检测到新的提交差异或新的工作区改动。',
       patch: ''
     };
   }
@@ -147,6 +226,11 @@ export async function summarizeWorkspaceChanges(before, after) {
     supported: true,
     changedFiles,
     summary: summaryLines.join('\n'),
-    patch: trimOutput(patchOutput.trim(), 12000)
+    patch: trimOutput(patchOutput.trim(), 12000),
+    branchChange: null,
+    commitChange: {
+      before: before.head,
+      after: after.head
+    }
   };
 }

@@ -30,6 +30,8 @@ function normalizeSession(alias, session) {
     lastDiffSummary: session?.lastDiffSummary || '',
     lastDiffPatch: session?.lastDiffPatch || '',
     lastChangedFiles: Array.isArray(session?.lastChangedFiles) ? session.lastChangedFiles : [],
+    lastBranchChange: session?.lastBranchChange || null,
+    lastCommitChange: session?.lastCommitChange || null,
     lastUserMessage: session?.lastUserMessage || '',
     lastAssistantMessage: session?.lastAssistantMessage || '',
     updatedAt,

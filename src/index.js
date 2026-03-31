@@ -99,7 +99,7 @@ function formatRecentSessions(chatKey) {
   return lines.join('\n');
 }
 
-function buildResultCard({ chatKey, alias, output, sessionId, workspace, status = 'idle', title = 'Codex 结果' }) {
+function buildResultCard({ chatKey, alias, output, sessionId, workspace, status = 'idle', branchChange = null, commitChange = null, title = 'Codex 结果' }) {
   const record = store.get(chatKey);
   const sessions = store.listSessions(chatKey).slice(0, 3);
   const elements = [
@@ -115,9 +115,11 @@ function buildResultCard({ chatKey, alias, output, sessionId, workspace, status 
       content: [
         `**会话**: ${alias}`,
         `**状态**: ${getStatusLabel(status)}`,
+        branchChange ? `**分支变化**: ${branchChange.before} -> ${branchChange.after}` : null,
+        commitChange ? `**提交变化**: ${commitChange.before.slice(0, 7)} -> ${commitChange.after.slice(0, 7)}` : null,
         `**会话 ID**: ${sessionId || '未知'}`,
         `**工作目录**: \`${workspace || config.defaultWorkspace}\``
-      ].join('\n')
+      ].filter(Boolean).join('\n')
     }
   ];
 
@@ -226,6 +228,15 @@ function formatDiffDetails(session) {
     lines.push(session.lastDiffPatch.slice(0, 6000));
   }
 
+  if (session.lastBranchChange) {
+    lines.push('');
+    lines.push(`最近分支变化: ${session.lastBranchChange.before} -> ${session.lastBranchChange.after}`);
+  }
+
+  if (session.lastCommitChange?.before && session.lastCommitChange?.after) {
+    lines.push(`最近提交变化: ${session.lastCommitChange.before.slice(0, 7)} -> ${session.lastCommitChange.after.slice(0, 7)}`);
+  }
+
   return lines.filter(Boolean).join('\n');
 }
 
@@ -307,6 +318,25 @@ function formatHelp() {
     '/sessions：查看最近活跃的几个会话',
     '/status：查看当前聊天状态',
     '/help：显示帮助'
+  ].join('\n');
+}
+
+function formatUnknownCommand(command) {
+  return [
+    `未识别命令: ${command}`,
+    '',
+    '这条消息以 `/` 开头，所以我没有把它发送给 Codex。',
+    '如果这是手误，请直接重新输入正确命令，或发送普通文本。',
+    '',
+    '可用命令:',
+    '/new',
+    '/cwd',
+    '/delete',
+    '/show S1',
+    '/diff S1',
+    '/sessions',
+    '/status',
+    '/help'
   ].join('\n');
 }
 
@@ -536,6 +566,11 @@ async function handleCommand(client, event, text) {
     return true;
   }
 
+  if (command.startsWith('/')) {
+    await sendTextMessage(client, event.message.chat_id, formatUnknownCommand(command));
+    return true;
+  }
+
   return false;
 }
 
@@ -584,6 +619,8 @@ async function queueTurn(client, event, prompt, alias) {
         lastDiffSummary: diff.summary,
         lastDiffPatch: diff.patch,
         lastChangedFiles: diff.changedFiles,
+        lastBranchChange: diff.branchChange,
+        lastCommitChange: diff.commitChange,
         lastFinishedAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       });
@@ -605,6 +642,8 @@ async function queueTurn(client, event, prompt, alias) {
         sessionId: result.sessionId || '未知',
         workspace,
         status: 'success',
+        branchChange: diff.branchChange,
+        commitChange: diff.commitChange,
         title: 'Codex 结果'
       });
     })
@@ -616,6 +655,8 @@ async function queueTurn(client, event, prompt, alias) {
         lastDiffSummary: '',
         lastDiffPatch: '',
         lastChangedFiles: [],
+        lastBranchChange: null,
+        lastCommitChange: null,
         lastFinishedAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       }).catch(() => {});
