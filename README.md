@@ -14,14 +14,22 @@
 - 同一聊天里可保留多个会话
 - 每个会话可绑定自己的工作目录
 - 每个会话都会显示状态：空闲 / 运行中 / 已完成 / 失败
+- 每个会话都可以独立选择 Agent：Codex / Claude Code / Cursor Agent / OpenCode
 - 每次结果里自动附带最近活跃的几个会话摘要
 - 每次结果会直接以一张卡片发送，卡片里同时展示结果、会话信息和可用命令
 - 每轮完成后会附带代码改动摘要，便于人工审查
 - 如果本轮发生了分支切换或提交变化，也会直接显示在结果卡片里
 - `S1: 继续处理` 这种前缀可把消息发给指定会话
 - `/new` 创建新会话
+- `/new cursor` 创建新会话并直接指定 Agent
 - `/new /path/to/project` 创建新会话并直接指定工作目录
+- `/new cursor /path/to/project` 创建新会话并同时指定 Agent 和工作目录
 - `/new /path/to/project 你的第一条指令` 创建新会话、指定目录并立即开始第一轮
+- `/new cursor /path/to/project 你的第一条指令` 创建新会话、指定 Agent、指定目录并立即开始第一轮
+- `/agent` 查看当前活跃会话使用的 Agent
+- `/agent claude` 将当前活跃会话切换到 Claude Code
+- `/agent S1 cursor` 将指定会话切换到 Cursor Agent
+- `/agent S1 opencode` 将指定会话切换到 OpenCode
 - `/cwd` 查看当前活跃会话的工作目录
 - `/cwd /path/to/project` 修改当前活跃会话的工作目录
 - `/cwd S1 /path/to/project` 修改指定会话的工作目录
@@ -65,8 +73,14 @@
 FEISHU_APP_ID=cli_xxx
 FEISHU_APP_SECRET=xxx
 FEISHU_BOT_OPEN_ID=ou_xxx
+AGENT_PROVIDER=codex
 CODEX_WORKSPACE=/Users/xzq/Documents/Playground
 CODEX_BIN=/Applications/Codex.app/Contents/Resources/codex
+CLAUDE_BIN=claude
+CLAUDE_PERMISSION_MODE=bypassPermissions
+CLAUDE_SETTING_SOURCES=
+CURSOR_AGENT_BIN=cursor-agent
+OPENCODE_BIN=opencode
 CODEX_SANDBOX=workspace-write
 CODEX_AUTO_APPROVAL=true
 CODEX_SKIP_GIT_REPO_CHECK=true
@@ -75,8 +89,10 @@ CODEX_SKIP_GIT_REPO_CHECK=true
 说明：
 
 - `FEISHU_BOT_OPEN_ID` 用来忽略机器人自己发出的消息，避免回环
+- `AGENT_PROVIDER` 用来设置默认 Agent，可选 `codex`、`claude`、`cursor`、`opencode`
 - `CODEX_WORKSPACE` 是 Codex 真正工作的目录
 - `CODEX_WORKSPACE` 现在只作为默认目录，新会话会默认继承它；后续可以在飞书里按会话改掉
+- `CLAUDE_SETTING_SOURCES` 可选；如果你的 `~/.claude/settings.json` 里配了代理或自定义网关，想临时忽略用户级配置，可设成 `project,local`
 - `CODEX_AUTO_APPROVAL=true` 会让 Codex 以无人值守方式执行，适合实验环境，风险更高
 - `CODEX_SKIP_GIT_REPO_CHECK=true` 允许你把工作目录指到非 git 仓库，适合 MVP 实验
 - 当 `CODEX_AUTO_APPROVAL=true` 时，Codex 会跳过审批并绕过 sandbox；如果你想保留 `workspace-write` 隔离，请把它设为 `false`
@@ -116,6 +132,24 @@ npm start
 
 其中空闲会话会明确标成 `空闲`，方便你快速挑一个继续推进，不让它闲着。
 
+如果你想切换某个会话使用的 Agent：
+
+```text
+/agent S1 claude
+```
+
+或者：
+
+```text
+/agent S1 cursor
+```
+
+或者：
+
+```text
+/agent S1 opencode
+```
+
 如果你想新开一个话题：
 
 ```text
@@ -124,16 +158,34 @@ npm start
 
 然后直接发新消息即可。
 
+如果你想新建会话时直接指定 Agent：
+
+```text
+/new cursor
+```
+
 如果你想新建会话时直接指定目录：
 
 ```text
 /new /Users/xzq/project-a
 ```
 
+如果你想新建会话时同时指定 Agent 和目录：
+
+```text
+/new cursor /Users/xzq/project-a
+```
+
 如果你想新建会话、指定目录并立刻开始：
 
 ```text
 /new /Users/xzq/project-a 帮我分析这个仓库的测试失败原因
+```
+
+如果你想新建会话、指定 Agent、指定目录并立刻开始：
+
+```text
+/new cursor /Users/xzq/project-a 帮我分析这个仓库的测试失败原因
 ```
 
 如果你想切换当前会话的工作目录：
@@ -190,15 +242,15 @@ S1: 把 README 也补上
 
 ```text
 src/config.js          环境变量读取
-src/codex-runner.js    Codex CLI 调用与 JSONL 解析
-src/session-store.js   聊天到多个 Codex 会话的持久化映射
+src/agent-runner.js    Agent 执行器抽象，支持 Codex / Claude / Cursor / OpenCode
+src/session-store.js   聊天到多个 Agent 会话的持久化映射
 src/index.js           飞书长连接入口
 data/sessions.json     运行时自动生成
 ```
 
 ## 已知限制
 
-- 当前最近会话摘要默认展示前 3 个
+- 当前最近会话摘要默认展示前 5 个
 - `/show S1` 当前只展示最近 10 条文本消息
 - `/diff S1` 会优先比较 git 提交点前后差异，再回退到工作区前后快照；非 git 目录下无法提供代码 diff 摘要
 - 删除会话后，剩余会话会自动重排编号

@@ -4,12 +4,31 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { config } from './config.js';
-import { runCodexTurn } from './codex-runner.js';
+import { runAgentTurn } from './agent-runner.js';
 import { SessionStore } from './session-store.js';
 import { captureWorkspaceSnapshot, summarizeWorkspaceChanges } from './workspace-diff.js';
 
 const store = new SessionStore(config.dataDir);
 const activeJobs = new Map();
+const runtimeLogPath = path.join(config.dataDir, 'runtime.log');
+const RECENT_SESSION_LIMIT = 5;
+
+function getJobKey(chatKey, alias) {
+  return `${chatKey}::${alias}`;
+}
+
+async function logRuntime(message, details = null) {
+  const line = [
+    `[${new Date().toISOString()}] ${message}`,
+    details ? JSON.stringify(details, null, 2) : ''
+  ].filter(Boolean).join('\n');
+  try {
+    await fs.mkdir(config.dataDir, { recursive: true });
+    await fs.appendFile(runtimeLogPath, `${line}\n\n`, 'utf8');
+  } catch (error) {
+    console.error('[runtime-log-failed]', error);
+  }
+}
 
 function getStatusLabel(status) {
   switch (status) {
@@ -39,6 +58,25 @@ function getStatusBadge(status) {
   }
 }
 
+function getProviderLabel(provider) {
+  switch ((provider || '').toLowerCase()) {
+    case 'claude':
+      return 'Claude Code';
+    case 'cursor':
+      return 'Cursor Agent';
+    case 'opencode':
+      return 'OpenCode';
+    case 'codex':
+    default:
+      return 'Codex';
+  }
+}
+
+function hasRunningJob(chatKey) {
+  const prefix = `${chatKey}::`;
+  return Array.from(activeJobs.keys()).some((key) => key.startsWith(prefix));
+}
+
 function trimPreview(text, max = 80) {
   const normalized = (text || '').replace(/\s+/g, ' ').trim();
   if (!normalized) {
@@ -64,6 +102,10 @@ function parseSessionPrefixedPrompt(text) {
   };
 }
 
+function isAgentProviderToken(token) {
+  return ['codex', 'claude', 'cursor', 'opencode'].includes((token || '').toLowerCase());
+}
+
 function tokenizeCommandArgs(input) {
   const matches = input.match(/"([^"]+)"|'([^']+)'|[^\s]+/g) || [];
   return matches.map((token) => {
@@ -79,7 +121,7 @@ function tokenizeCommandArgs(input) {
 
 function formatRecentSessions(chatKey) {
   const record = store.get(chatKey);
-  const sessions = store.listSessions(chatKey).slice(0, 3);
+  const sessions = store.listSessions(chatKey).slice(0, RECENT_SESSION_LIMIT);
   if (!sessions.length) {
     return '最近会话: 暂无';
   }
@@ -94,14 +136,14 @@ function formatRecentSessions(chatKey) {
       60
     );
     const workspace = session.workspace ? ` @ ${trimPreview(session.workspace, 36)}` : '';
-    lines.push(`${session.alias}${activeMark} ${getStatusBadge(session.status)} ${preview}${workspace}`);
+    lines.push(`${session.alias}${activeMark} ${getStatusBadge(session.status)} [${getProviderLabel(session.provider)}] ${preview}${workspace}`);
   }
   return lines.join('\n');
 }
 
-function buildResultCard({ chatKey, alias, output, sessionId, workspace, status = 'idle', branchChange = null, commitChange = null, title = 'Codex 结果' }) {
+function buildResultCard({ chatKey, alias, output, sessionId, workspace, status = 'idle', provider = 'codex', branchChange = null, commitChange = null, title = 'Agent 结果' }) {
   const record = store.get(chatKey);
-  const sessions = store.listSessions(chatKey).slice(0, 3);
+  const sessions = store.listSessions(chatKey).slice(0, RECENT_SESSION_LIMIT);
   const elements = [
     {
       tag: 'markdown',
@@ -114,6 +156,7 @@ function buildResultCard({ chatKey, alias, output, sessionId, workspace, status 
       tag: 'markdown',
       content: [
         `**会话**: ${alias}`,
+        `**Agent**: ${getProviderLabel(provider)}`,
         `**状态**: ${getStatusLabel(status)}`,
         branchChange ? `**分支变化**: ${branchChange.before} -> ${branchChange.after}` : null,
         commitChange ? `**提交变化**: ${commitChange.before.slice(0, 7)} -> ${commitChange.after.slice(0, 7)}` : null,
@@ -141,7 +184,7 @@ function buildResultCard({ chatKey, alias, output, sessionId, workspace, status 
       const sessionWorkspace = trimPreview(session.workspace || config.defaultWorkspace, 50);
       elements.push({
         tag: 'markdown',
-        content: `**${session.alias}${isActive ? ' · 当前' : ''} · ${getStatusLabel(session.status)}**\n${preview}\n目录: \`${sessionWorkspace}\``
+        content: `**${session.alias}${isActive ? ' · 当前' : ''} · ${getStatusLabel(session.status)} · ${getProviderLabel(session.provider)}**\n${preview}\n目录: \`${sessionWorkspace}\``
       });
     }
   }
@@ -181,12 +224,13 @@ function formatSessionTranscript(session, limit = 10) {
 
   const lines = [
     `${session.alias} 最近 ${recentTurns.length} 条消息:`,
+    `Agent: ${getProviderLabel(session.provider)}`,
     `状态: ${getStatusLabel(session.status)}`,
     `工作目录: ${session.workspace || config.defaultWorkspace}`
   ];
 
   for (const turn of recentTurns) {
-    const label = turn.role === 'assistant' ? 'Codex' : '你';
+    const label = turn.role === 'assistant' ? getProviderLabel(session.provider) : '你';
     lines.push('');
     lines.push(`${label}: ${turn.text}`);
   }
@@ -197,6 +241,7 @@ function formatSessionTranscript(session, limit = 10) {
 function formatWorkspaceStatus(session) {
   return [
     `会话: ${session.alias}`,
+    `Agent: ${getProviderLabel(session.provider)}`,
     `状态: ${getStatusLabel(session.status)}`,
     `工作目录: ${session.workspace || config.defaultWorkspace}`,
     session.lastChangedFiles?.length ? `最近改动文件数: ${session.lastChangedFiles.length}` : null
@@ -210,6 +255,7 @@ function formatDiffDetails(session) {
 
   const lines = [
     `会话: ${session.alias}`,
+    `Agent: ${getProviderLabel(session.provider)}`,
     `状态: ${getStatusLabel(session.status)}`,
     `工作目录: ${session.workspace || config.defaultWorkspace}`
   ];
@@ -262,26 +308,38 @@ async function resolveWorkspaceInput(input) {
 async function parseNewCommand(command) {
   const rest = command.replace(/^\/new\b/i, '').trim();
   if (!rest) {
-    return { workspace: null, prompt: '' };
+    return { provider: null, workspace: null, prompt: '' };
   }
 
   const tokens = tokenizeCommandArgs(rest);
   if (!tokens.length) {
-    return { workspace: null, prompt: '' };
+    return { provider: null, workspace: null, prompt: '' };
   }
 
-  for (let count = tokens.length; count >= 1; count -= 1) {
-    const candidate = tokens.slice(0, count).join(' ');
+  let provider = null;
+  let startIndex = 0;
+  if (isAgentProviderToken(tokens[0])) {
+    provider = tokens[0].toLowerCase();
+    startIndex = 1;
+  }
+
+  const remainingTokens = tokens.slice(startIndex);
+  if (!remainingTokens.length) {
+    return { provider, workspace: null, prompt: '' };
+  }
+
+  for (let count = remainingTokens.length; count >= 1; count -= 1) {
+    const candidate = remainingTokens.slice(0, count).join(' ');
     try {
       const workspace = await resolveWorkspaceInput(candidate);
-      const prompt = rest.slice(candidate.length).trim();
-      return { workspace, prompt };
+      const prompt = remainingTokens.slice(count).join(' ').trim();
+      return { provider, workspace, prompt };
     } catch {
       // Keep trying shorter prefixes until one resolves to a real directory.
     }
   }
 
-  return { workspace: null, prompt: rest };
+  return { provider, workspace: null, prompt: remainingTokens.join(' ').trim() };
 }
 
 function getTextContent(content) {
@@ -307,7 +365,14 @@ function formatHelp() {
     '',
     '直接发送文本：发给当前活跃会话',
     'S1: 继续优化这个方案：把消息发给指定会话',
+    '/agent：查看当前活跃会话使用的 Agent',
+    '/agent claude：把当前活跃会话切到 Claude Code',
+    '/agent S1 cursor：把指定会话切到 Cursor Agent',
+    '/agent S1 opencode：把指定会话切到 OpenCode',
     '/new：创建一个新的会话，并设为当前活跃',
+    '/new cursor：创建一个使用 Cursor Agent 的新会话',
+    '/new cursor /path/to/project：创建新会话并同时指定 Agent 和目录',
+    '/new cursor /path/to/project 你的第一条指令：创建新会话并立即开始',
     '/cwd：查看当前活跃会话的工作目录',
     '/cwd /path/to/project：修改当前活跃会话的工作目录',
     '/cwd S1 /path/to/project：修改指定会话的工作目录',
@@ -342,13 +407,16 @@ function formatUnknownCommand(command) {
 
 function formatStatus(chatKey) {
   const record = store.get(chatKey);
-  const running = activeJobs.get(chatKey);
+  const running = hasRunningJob(chatKey);
   const idleSessions = store.listSessions(chatKey).filter((session) => session.status === 'idle');
   return [
     `聊天: ${chatKey}`,
     `当前会话: ${record.activeAlias || '无'}`,
     `状态: ${running ? '处理中' : '空闲'}`,
     `会话数量: ${store.listSessions(chatKey).length}`,
+    record.activeAlias && store.getSession(chatKey, record.activeAlias)
+      ? `当前 Agent: ${getProviderLabel(store.getSession(chatKey, record.activeAlias).provider)}`
+      : `默认 Agent: ${getProviderLabel(config.defaultAgentProvider)}`,
     idleSessions.length ? `空闲会话: ${idleSessions.map((session) => session.alias).join(', ')}` : '空闲会话: 无',
     record.activeAlias && store.getSession(chatKey, record.activeAlias)
       ? `当前目录: ${store.getSession(chatKey, record.activeAlias).workspace || config.defaultWorkspace}`
@@ -407,9 +475,51 @@ async function handleCommand(client, event, text) {
     return true;
   }
 
+  if (command.toLowerCase() === '/agent') {
+    const session = await store.ensureActiveSession(chatKey);
+    await sendTextMessage(
+      client,
+      event.message.chat_id,
+      [`会话: ${session.alias}`, `当前 Agent: ${getProviderLabel(session.provider || config.defaultAgentProvider)}`].join('\n')
+    );
+    return true;
+  }
+
+  const agentMatch = command.match(/^\/agent(?:\s+(S\d+))?\s+(codex|claude|cursor|opencode)$/i);
+  if (agentMatch) {
+    const alias = agentMatch[1]?.toUpperCase() || (await store.ensureActiveSession(chatKey)).alias;
+    const provider = agentMatch[2].toLowerCase();
+    const session = store.getSession(chatKey, alias);
+    if (!session) {
+      await sendTextMessage(client, event.message.chat_id, `没有找到 ${alias}。发送 /sessions 看最近会话。`);
+      return true;
+    }
+    await store.updateSession(chatKey, alias, {
+      provider,
+      sessionId: null,
+      status: 'idle',
+      currentTaskPreview: ''
+    });
+    await sendTextMessage(
+      client,
+      event.message.chat_id,
+      [`已将 ${alias} 切换到 ${getProviderLabel(provider)}。`, '下一条发给这个会话的消息会使用新的 Agent。'].join('\n')
+    );
+    return true;
+  }
+
   if (command.toLowerCase().startsWith('/new')) {
-    const session = await store.createSession(chatKey);
     const parsed = await parseNewCommand(command);
+    const session = await store.createSession(chatKey);
+    if (parsed.provider) {
+      await store.updateSession(chatKey, session.alias, {
+        provider: parsed.provider,
+        sessionId: null,
+        status: 'idle',
+        currentTaskPreview: ''
+      });
+      session.provider = parsed.provider;
+    }
     if (parsed.workspace) {
       await store.updateSession(chatKey, session.alias, { workspace: parsed.workspace });
       session.workspace = parsed.workspace;
@@ -421,6 +531,7 @@ async function handleCommand(client, event, text) {
         event.message.chat_id,
         [
           `已创建新会话 ${session.alias}。`,
+          `Agent: ${getProviderLabel(session.provider || config.defaultAgentProvider)}`,
           `工作目录: ${session.workspace || config.defaultWorkspace}`,
           '你的首条指令也已收到，马上开始执行。',
           '',
@@ -436,6 +547,7 @@ async function handleCommand(client, event, text) {
       event.message.chat_id,
       [
         `已创建新会话 ${session.alias}。`,
+        `Agent: ${getProviderLabel(session.provider || config.defaultAgentProvider)}`,
         `工作目录: ${session.workspace || config.defaultWorkspace}`,
         '现在直接发送文本，默认会进入这个新会话。',
         '',
@@ -576,16 +688,18 @@ async function handleCommand(client, event, text) {
 
 async function queueTurn(client, event, prompt, alias) {
   const chatKey = getChatKey(event);
-  const prior = activeJobs.get(chatKey) || Promise.resolve();
+  const jobKey = getJobKey(chatKey, alias);
+  const prior = activeJobs.get(jobKey) || Promise.resolve();
 
   const next = prior
     .catch(() => {})
     .then(async () => {
       const session = await store.touchSession(chatKey, alias);
       const workspace = session?.workspace || config.defaultWorkspace;
+      const provider = session?.provider || config.defaultAgentProvider;
       const opening = session?.sessionId
-        ? `已收到，继续 ${alias} 处理中。`
-        : `已收到，正在为你启动新的会话 ${alias}。`;
+        ? `已收到，继续 ${alias}（${getProviderLabel(provider)}）处理中。`
+        : `已收到，正在为你启动新的会话 ${alias}（${getProviderLabel(provider)}）。`;
       await sendTextMessage(client, event.message.chat_id, opening);
 
       await store.appendTurn(chatKey, alias, {
@@ -600,7 +714,8 @@ async function queueTurn(client, event, prompt, alias) {
       });
       const beforeSnapshot = await captureWorkspaceSnapshot(workspace);
 
-      const result = await runCodexTurn({
+      const result = await runAgentTurn({
+        provider,
         sessionId: session?.sessionId || null,
         prompt,
         config: {
@@ -613,6 +728,7 @@ async function queueTurn(client, event, prompt, alias) {
 
       await store.updateSession(chatKey, alias, {
         sessionId: result.sessionId,
+        provider,
         status: 'idle',
         currentTaskPreview: '',
         lastResultPreview: trimPreview(result.output || 'Codex 没有返回正文。', 120),
@@ -642,12 +758,27 @@ async function queueTurn(client, event, prompt, alias) {
         sessionId: result.sessionId || '未知',
         workspace,
         status: 'success',
+        provider,
         branchChange: diff.branchChange,
         commitChange: diff.commitChange,
-        title: 'Codex 结果'
+        title: `${getProviderLabel(provider)} 结果`
       });
     })
     .catch(async (error) => {
+      const currentSession = store.getSession(chatKey, alias);
+      const providerLabel = getProviderLabel(currentSession?.provider || config.defaultAgentProvider);
+      await logRuntime('agent-turn-failed', {
+        chatKey,
+        alias,
+        provider: currentSession?.provider || config.defaultAgentProvider,
+        workspace: currentSession?.workspace || config.defaultWorkspace,
+        error: {
+          message: error?.message || '未知错误',
+          stderr: error?.stderr || '',
+          exitCode: error?.exitCode ?? null,
+          stack: error?.stack || ''
+        }
+      });
       await store.updateSession(chatKey, alias, {
         status: 'error',
         currentTaskPreview: '',
@@ -664,16 +795,16 @@ async function queueTurn(client, event, prompt, alias) {
       await sendTextMessage(
         client,
         event.message.chat_id,
-        ['Codex 执行失败。', '', detail || '没有拿到更多错误信息。', '', '发送 /status 查看当前状态，或 /new 重开会话。'].join('\n')
+        [`${providerLabel} 执行失败。`, '', detail || '没有拿到更多错误信息。', '', '发送 /status 查看当前状态，或 /new 重开会话。'].join('\n')
       );
     })
     .finally(() => {
-      if (activeJobs.get(chatKey) === next) {
-        activeJobs.delete(chatKey);
+      if (activeJobs.get(jobKey) === next) {
+        activeJobs.delete(jobKey);
       }
     });
 
-  activeJobs.set(chatKey, next);
+  activeJobs.set(jobKey, next);
   await next;
 }
 
@@ -687,65 +818,81 @@ async function main() {
 
   const dispatcher = new Lark.EventDispatcher({}).register({
     'im.message.receive_v1': async (payload) => {
-      const event = payload.event ?? payload;
-      const message = event?.message;
-      console.log('[event]', {
-        type: 'im.message.receive_v1',
-        chatId: message?.chat_id,
-        messageType: message?.message_type,
-        senderOpenId: getSenderOpenId(event)
-      });
+      try {
+        const event = payload.event ?? payload;
+        const message = event?.message;
+        console.log('[event]', {
+          type: 'im.message.receive_v1',
+          chatId: message?.chat_id,
+          messageType: message?.message_type,
+          senderOpenId: getSenderOpenId(event)
+        });
 
-      if (!message) {
-        return;
-      }
-
-      if (message.message_type !== 'text') {
-        await sendTextMessage(client, message.chat_id, '当前 MVP 只支持文本消息。');
-        return;
-      }
-
-      const senderOpenId = getSenderOpenId(event);
-      if (config.feishuBotOpenId && senderOpenId === config.feishuBotOpenId) {
-        return;
-      }
-
-      const text = getTextContent(message.content);
-      console.log('[message]', { chatId: message.chat_id, text });
-      if (!text) {
-        await sendTextMessage(client, message.chat_id, '没有解析到文本内容，请直接发送文本消息。');
-        return;
-      }
-
-      if (await handleCommand(client, event, text)) {
-        return;
-      }
-
-      const chatKey = getChatKey(event);
-      const prefixed = parseSessionPrefixedPrompt(text);
-      let alias;
-      let prompt;
-
-      if (prefixed) {
-        alias = prefixed.alias;
-        prompt = prefixed.prompt;
-        const targetSession = store.getSession(chatKey, alias);
-        if (!targetSession) {
-          await sendTextMessage(client, message.chat_id, `没有找到 ${alias}。发送 /sessions 看最近会话，或 /new 新建一个。`);
+        if (!message) {
           return;
         }
-      } else {
-        const active = await store.ensureActiveSession(chatKey);
-        alias = active.alias;
-        prompt = text;
-      }
 
-      if (!prompt) {
-        await sendTextMessage(client, message.chat_id, '没有解析到要发送给 Codex 的文本。');
-        return;
-      }
+        if (message.message_type !== 'text') {
+          await sendTextMessage(client, message.chat_id, '当前 MVP 只支持文本消息。');
+          return;
+        }
 
-      void queueTurn(client, event, prompt, alias);
+        const senderOpenId = getSenderOpenId(event);
+        if (config.feishuBotOpenId && senderOpenId === config.feishuBotOpenId) {
+          return;
+        }
+
+        const text = getTextContent(message.content);
+        console.log('[message]', { chatId: message.chat_id, text });
+        if (!text) {
+          await sendTextMessage(client, message.chat_id, '没有解析到文本内容，请直接发送文本消息。');
+          return;
+        }
+
+        if (await handleCommand(client, event, text)) {
+          return;
+        }
+
+        const chatKey = getChatKey(event);
+        const prefixed = parseSessionPrefixedPrompt(text);
+        let alias;
+        let prompt;
+
+        if (prefixed) {
+          alias = prefixed.alias;
+          prompt = prefixed.prompt;
+          const targetSession = store.getSession(chatKey, alias);
+          if (!targetSession) {
+            await sendTextMessage(client, message.chat_id, `没有找到 ${alias}。发送 /sessions 看最近会话，或 /new 新建一个。`);
+            return;
+          }
+        } else {
+          const active = await store.ensureActiveSession(chatKey);
+          alias = active.alias;
+          prompt = text;
+        }
+
+        if (!prompt) {
+          await sendTextMessage(client, message.chat_id, '没有解析到要发送给 Codex 的文本。');
+          return;
+        }
+
+        void queueTurn(client, event, prompt, alias);
+      } catch (error) {
+        const event = payload.event ?? payload;
+        const message = event?.message;
+        await logRuntime('message-handler-failed', {
+          chatId: message?.chat_id || '',
+          rawContent: message?.content || '',
+          error: {
+            message: error?.message || '未知错误',
+            stack: error?.stack || ''
+          }
+        });
+        if (message?.chat_id) {
+          await sendTextMessage(client, message.chat_id, '机器人处理这条消息时出了点问题。我已经把错误记到日志里了，你可以稍后重试一次。');
+        }
+      }
     }
   });
 
@@ -757,6 +904,22 @@ async function main() {
 
   wsClient.start({
     eventDispatcher: dispatcher
+  });
+
+  process.on('unhandledRejection', (reason) => {
+    console.error('[unhandledRejection]', reason);
+    void logRuntime('unhandled-rejection', {
+      reason: reason instanceof Error
+        ? { message: reason.message, stack: reason.stack || '' }
+        : { value: String(reason) }
+    });
+  });
+
+  process.on('uncaughtException', (error) => {
+    console.error('[uncaughtException]', error);
+    void logRuntime('uncaught-exception', {
+      error: { message: error.message, stack: error.stack || '' }
+    });
   });
 
   process.on('SIGINT', async () => {
