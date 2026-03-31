@@ -35,6 +35,7 @@ export const config = {
   claudeBin: process.env.CLAUDE_BIN || 'claude',
   claudeModel: process.env.CLAUDE_MODEL || '',
   claudePermissionMode: process.env.CLAUDE_PERMISSION_MODE || 'bypassPermissions',
+  claudeSettingSources: process.env.CLAUDE_SETTING_SOURCES || '',
   cursorAgentBin: process.env.CURSOR_AGENT_BIN || 'cursor-agent',
   cursorModel: process.env.CURSOR_MODEL || '',
   opencodeBin: process.env.OPENCODE_BIN || 'opencode',

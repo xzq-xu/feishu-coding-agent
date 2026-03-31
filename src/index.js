@@ -711,6 +711,8 @@ async function queueTurn(client, event, prompt, alias) {
       });
     })
     .catch(async (error) => {
+      const currentSession = store.getSession(chatKey, alias);
+      const providerLabel = getProviderLabel(currentSession?.provider || config.defaultAgentProvider);
       await store.updateSession(chatKey, alias, {
         status: 'error',
         currentTaskPreview: '',
@@ -727,7 +729,7 @@ async function queueTurn(client, event, prompt, alias) {
       await sendTextMessage(
         client,
         event.message.chat_id,
-        ['Codex 执行失败。', '', detail || '没有拿到更多错误信息。', '', '发送 /status 查看当前状态，或 /new 重开会话。'].join('\n')
+        [`${providerLabel} 执行失败。`, '', detail || '没有拿到更多错误信息。', '', '发送 /status 查看当前状态，或 /new 重开会话。'].join('\n')
       );
     })
     .finally(() => {

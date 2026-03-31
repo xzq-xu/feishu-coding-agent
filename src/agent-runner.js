@@ -42,6 +42,22 @@ async function collectExit(child) {
   });
 }
 
+function extractProcessErrorDetail(provider, stdout, stderr) {
+  const combined = `${safeTrim(stderr)}\n${safeTrim(stdout)}`.trim();
+  if (provider === 'cursor' && /press any key to sign in/i.test(combined)) {
+    return 'Cursor Agent 未登录，请先在本机运行 `cursor-agent` 完成登录。';
+  }
+  const stdoutParsed = parseJsonOutput(stdout);
+  if (stdoutParsed.output) {
+    return stdoutParsed.output;
+  }
+  const stderrParsed = parseJsonOutput(stderr);
+  if (stderrParsed.output) {
+    return stderrParsed.output;
+  }
+  return safeTrim(stderr) || safeTrim(stdout) || '未知错误';
+}
+
 function buildCodexArgs(config, sessionId, prompt, workspace) {
   const args = ['exec', '--json', '-C', workspace];
   if (config.codexSkipGitRepoCheck) {
@@ -134,9 +150,12 @@ async function runPrintAgent({ provider, bin, args, workspace, sessionId }) {
 
   const exitCode = await collectExit(child);
   if (exitCode !== 0) {
-    const error = new Error(`${provider} exited with code ${exitCode}`);
+    const detail = extractProcessErrorDetail(provider, stdout, stderr);
+    const error = new Error(detail);
     error.exitCode = exitCode;
-    error.stderr = stderr || stdout;
+    error.stderr = detail;
+    error.stdout = safeTrim(stdout);
+    error.rawStderr = stderr;
     throw error;
   }
 
@@ -154,6 +173,9 @@ async function runClaudeTurn({ sessionId, prompt, config, workspace }) {
   const args = ['-p', '--output-format', 'json'];
   if (config.claudePermissionMode) {
     args.push('--permission-mode', config.claudePermissionMode);
+  }
+  if (config.claudeSettingSources) {
+    args.push('--setting-sources', config.claudeSettingSources);
   }
   if (config.claudeModel) {
     args.push('--model', config.claudeModel);

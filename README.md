@@ -75,6 +75,7 @@ CODEX_WORKSPACE=/Users/xzq/Documents/Playground
 CODEX_BIN=/Applications/Codex.app/Contents/Resources/codex
 CLAUDE_BIN=claude
 CLAUDE_PERMISSION_MODE=bypassPermissions
+CLAUDE_SETTING_SOURCES=
 CURSOR_AGENT_BIN=cursor-agent
 OPENCODE_BIN=opencode
 CODEX_SANDBOX=workspace-write
@@ -85,9 +86,10 @@ CODEX_SKIP_GIT_REPO_CHECK=true
 说明：
 
 - `FEISHU_BOT_OPEN_ID` 用来忽略机器人自己发出的消息，避免回环
-- `AGENT_PROVIDER` 用来设置默认 Agent，可选 `codex`、`claude`、`cursor`
+- `AGENT_PROVIDER` 用来设置默认 Agent，可选 `codex`、`claude`、`cursor`、`opencode`
 - `CODEX_WORKSPACE` 是 Codex 真正工作的目录
 - `CODEX_WORKSPACE` 现在只作为默认目录，新会话会默认继承它；后续可以在飞书里按会话改掉
+- `CLAUDE_SETTING_SOURCES` 可选；如果你的 `~/.claude/settings.json` 里配了代理或自定义网关，想临时忽略用户级配置，可设成 `project,local`
 - `CODEX_AUTO_APPROVAL=true` 会让 Codex 以无人值守方式执行，适合实验环境，风险更高
 - `CODEX_SKIP_GIT_REPO_CHECK=true` 允许你把工作目录指到非 git 仓库，适合 MVP 实验
 - 当 `CODEX_AUTO_APPROVAL=true` 时，Codex 会跳过审批并绕过 sandbox；如果你想保留 `workspace-write` 隔离，请把它设为 `false`
@@ -219,8 +221,8 @@ S1: 把 README 也补上
 
 ```text
 src/config.js          环境变量读取
-src/agent-runner.js    Agent 执行器抽象，支持 Codex / Claude / Cursor
-src/session-store.js   聊天到多个 Codex 会话的持久化映射
+src/agent-runner.js    Agent 执行器抽象，支持 Codex / Claude / Cursor / OpenCode
+src/session-store.js   聊天到多个 Agent 会话的持久化映射
 src/index.js           飞书长连接入口
 data/sessions.json     运行时自动生成
 ```
