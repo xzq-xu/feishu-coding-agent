@@ -94,9 +94,9 @@ function buildCodexArgs(config, sessionId, prompt, workspace) {
     args.push('--model', config.codexModel);
   }
   if (sessionId) {
-    args.push('resume', sessionId, prompt);
+    args.push('resume', sessionId, '--', prompt);
   } else {
-    args.push(prompt);
+    args.push('--', prompt);
   }
   return args;
 }
