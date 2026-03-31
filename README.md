@@ -14,6 +14,7 @@
 - 同一聊天里可保留多个会话
 - 每个会话可绑定自己的工作目录
 - 每个会话都会显示状态：空闲 / 运行中 / 已完成 / 失败
+- 每个会话都可以独立选择 Agent：Codex / Claude Code / Cursor Agent / OpenCode
 - 每次结果里自动附带最近活跃的几个会话摘要
 - 每次结果会直接以一张卡片发送，卡片里同时展示结果、会话信息和可用命令
 - 每轮完成后会附带代码改动摘要，便于人工审查
@@ -22,6 +23,10 @@
 - `/new` 创建新会话
 - `/new /path/to/project` 创建新会话并直接指定工作目录
 - `/new /path/to/project 你的第一条指令` 创建新会话、指定目录并立即开始第一轮
+- `/agent` 查看当前活跃会话使用的 Agent
+- `/agent claude` 将当前活跃会话切换到 Claude Code
+- `/agent S1 cursor` 将指定会话切换到 Cursor Agent
+- `/agent S1 opencode` 将指定会话切换到 OpenCode
 - `/cwd` 查看当前活跃会话的工作目录
 - `/cwd /path/to/project` 修改当前活跃会话的工作目录
 - `/cwd S1 /path/to/project` 修改指定会话的工作目录
@@ -65,8 +70,13 @@
 FEISHU_APP_ID=cli_xxx
 FEISHU_APP_SECRET=xxx
 FEISHU_BOT_OPEN_ID=ou_xxx
+AGENT_PROVIDER=codex
 CODEX_WORKSPACE=/Users/xzq/Documents/Playground
 CODEX_BIN=/Applications/Codex.app/Contents/Resources/codex
+CLAUDE_BIN=claude
+CLAUDE_PERMISSION_MODE=bypassPermissions
+CURSOR_AGENT_BIN=cursor-agent
+OPENCODE_BIN=opencode
 CODEX_SANDBOX=workspace-write
 CODEX_AUTO_APPROVAL=true
 CODEX_SKIP_GIT_REPO_CHECK=true
@@ -75,6 +85,7 @@ CODEX_SKIP_GIT_REPO_CHECK=true
 说明：
 
 - `FEISHU_BOT_OPEN_ID` 用来忽略机器人自己发出的消息，避免回环
+- `AGENT_PROVIDER` 用来设置默认 Agent，可选 `codex`、`claude`、`cursor`
 - `CODEX_WORKSPACE` 是 Codex 真正工作的目录
 - `CODEX_WORKSPACE` 现在只作为默认目录，新会话会默认继承它；后续可以在飞书里按会话改掉
 - `CODEX_AUTO_APPROVAL=true` 会让 Codex 以无人值守方式执行，适合实验环境，风险更高
@@ -115,6 +126,24 @@ npm start
 - 可直接复制使用的文本命令提示
 
 其中空闲会话会明确标成 `空闲`，方便你快速挑一个继续推进，不让它闲着。
+
+如果你想切换某个会话使用的 Agent：
+
+```text
+/agent S1 claude
+```
+
+或者：
+
+```text
+/agent S1 cursor
+```
+
+或者：
+
+```text
+/agent S1 opencode
+```
 
 如果你想新开一个话题：
 
@@ -190,7 +219,7 @@ S1: 把 README 也补上
 
 ```text
 src/config.js          环境变量读取
-src/codex-runner.js    Codex CLI 调用与 JSONL 解析
+src/agent-runner.js    Agent 执行器抽象，支持 Codex / Claude / Cursor
 src/session-store.js   聊天到多个 Codex 会话的持久化映射
 src/index.js           飞书长连接入口
 data/sessions.json     运行时自动生成

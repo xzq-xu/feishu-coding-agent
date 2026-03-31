@@ -20,6 +20,7 @@ function normalizeSession(alias, session) {
   return {
     alias,
     sessionId: session?.sessionId || null,
+    provider: session?.provider || 'codex',
     title: session?.title || alias,
     workspace: session?.workspace || null,
     status: session?.status || 'idle',
@@ -143,6 +144,7 @@ export class SessionStore {
     record.activeAlias = alias;
     record.sessions[alias] = normalizeSession(alias, {
       title: alias,
+      provider: previousActive?.provider || null,
       workspace: previousActive?.workspace || null,
       updatedAt: new Date().toISOString()
     });

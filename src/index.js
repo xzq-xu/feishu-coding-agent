@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { config } from './config.js';
-import { runCodexTurn } from './codex-runner.js';
+import { runAgentTurn } from './agent-runner.js';
 import { SessionStore } from './session-store.js';
 import { captureWorkspaceSnapshot, summarizeWorkspaceChanges } from './workspace-diff.js';
 
@@ -36,6 +36,20 @@ function getStatusBadge(status) {
     case 'idle':
     default:
       return '[空闲]';
+  }
+}
+
+function getProviderLabel(provider) {
+  switch ((provider || '').toLowerCase()) {
+    case 'claude':
+      return 'Claude Code';
+    case 'cursor':
+      return 'Cursor Agent';
+    case 'opencode':
+      return 'OpenCode';
+    case 'codex':
+    default:
+      return 'Codex';
   }
 }
 
@@ -94,12 +108,12 @@ function formatRecentSessions(chatKey) {
       60
     );
     const workspace = session.workspace ? ` @ ${trimPreview(session.workspace, 36)}` : '';
-    lines.push(`${session.alias}${activeMark} ${getStatusBadge(session.status)} ${preview}${workspace}`);
+    lines.push(`${session.alias}${activeMark} ${getStatusBadge(session.status)} [${getProviderLabel(session.provider)}] ${preview}${workspace}`);
   }
   return lines.join('\n');
 }
 
-function buildResultCard({ chatKey, alias, output, sessionId, workspace, status = 'idle', branchChange = null, commitChange = null, title = 'Codex 结果' }) {
+function buildResultCard({ chatKey, alias, output, sessionId, workspace, status = 'idle', provider = 'codex', branchChange = null, commitChange = null, title = 'Agent 结果' }) {
   const record = store.get(chatKey);
   const sessions = store.listSessions(chatKey).slice(0, 3);
   const elements = [
@@ -114,6 +128,7 @@ function buildResultCard({ chatKey, alias, output, sessionId, workspace, status 
       tag: 'markdown',
       content: [
         `**会话**: ${alias}`,
+        `**Agent**: ${getProviderLabel(provider)}`,
         `**状态**: ${getStatusLabel(status)}`,
         branchChange ? `**分支变化**: ${branchChange.before} -> ${branchChange.after}` : null,
         commitChange ? `**提交变化**: ${commitChange.before.slice(0, 7)} -> ${commitChange.after.slice(0, 7)}` : null,
@@ -141,7 +156,7 @@ function buildResultCard({ chatKey, alias, output, sessionId, workspace, status 
       const sessionWorkspace = trimPreview(session.workspace || config.defaultWorkspace, 50);
       elements.push({
         tag: 'markdown',
-        content: `**${session.alias}${isActive ? ' · 当前' : ''} · ${getStatusLabel(session.status)}**\n${preview}\n目录: \`${sessionWorkspace}\``
+        content: `**${session.alias}${isActive ? ' · 当前' : ''} · ${getStatusLabel(session.status)} · ${getProviderLabel(session.provider)}**\n${preview}\n目录: \`${sessionWorkspace}\``
       });
     }
   }
@@ -197,6 +212,7 @@ function formatSessionTranscript(session, limit = 10) {
 function formatWorkspaceStatus(session) {
   return [
     `会话: ${session.alias}`,
+    `Agent: ${getProviderLabel(session.provider)}`,
     `状态: ${getStatusLabel(session.status)}`,
     `工作目录: ${session.workspace || config.defaultWorkspace}`,
     session.lastChangedFiles?.length ? `最近改动文件数: ${session.lastChangedFiles.length}` : null
@@ -210,6 +226,7 @@ function formatDiffDetails(session) {
 
   const lines = [
     `会话: ${session.alias}`,
+    `Agent: ${getProviderLabel(session.provider)}`,
     `状态: ${getStatusLabel(session.status)}`,
     `工作目录: ${session.workspace || config.defaultWorkspace}`
   ];
@@ -307,6 +324,10 @@ function formatHelp() {
     '',
     '直接发送文本：发给当前活跃会话',
     'S1: 继续优化这个方案：把消息发给指定会话',
+    '/agent：查看当前活跃会话使用的 Agent',
+    '/agent claude：把当前活跃会话切到 Claude Code',
+    '/agent S1 cursor：把指定会话切到 Cursor Agent',
+    '/agent S1 opencode：把指定会话切到 OpenCode',
     '/new：创建一个新的会话，并设为当前活跃',
     '/cwd：查看当前活跃会话的工作目录',
     '/cwd /path/to/project：修改当前活跃会话的工作目录',
@@ -349,6 +370,9 @@ function formatStatus(chatKey) {
     `当前会话: ${record.activeAlias || '无'}`,
     `状态: ${running ? '处理中' : '空闲'}`,
     `会话数量: ${store.listSessions(chatKey).length}`,
+    record.activeAlias && store.getSession(chatKey, record.activeAlias)
+      ? `当前 Agent: ${getProviderLabel(store.getSession(chatKey, record.activeAlias).provider)}`
+      : `默认 Agent: ${getProviderLabel(config.defaultAgentProvider)}`,
     idleSessions.length ? `空闲会话: ${idleSessions.map((session) => session.alias).join(', ')}` : '空闲会话: 无',
     record.activeAlias && store.getSession(chatKey, record.activeAlias)
       ? `当前目录: ${store.getSession(chatKey, record.activeAlias).workspace || config.defaultWorkspace}`
@@ -407,6 +431,39 @@ async function handleCommand(client, event, text) {
     return true;
   }
 
+  if (command.toLowerCase() === '/agent') {
+    const session = await store.ensureActiveSession(chatKey);
+    await sendTextMessage(
+      client,
+      event.message.chat_id,
+      [`会话: ${session.alias}`, `当前 Agent: ${getProviderLabel(session.provider || config.defaultAgentProvider)}`].join('\n')
+    );
+    return true;
+  }
+
+  const agentMatch = command.match(/^\/agent(?:\s+(S\d+))?\s+(codex|claude|cursor|opencode)$/i);
+  if (agentMatch) {
+    const alias = agentMatch[1]?.toUpperCase() || (await store.ensureActiveSession(chatKey)).alias;
+    const provider = agentMatch[2].toLowerCase();
+    const session = store.getSession(chatKey, alias);
+    if (!session) {
+      await sendTextMessage(client, event.message.chat_id, `没有找到 ${alias}。发送 /sessions 看最近会话。`);
+      return true;
+    }
+    await store.updateSession(chatKey, alias, {
+      provider,
+      sessionId: null,
+      status: 'idle',
+      currentTaskPreview: ''
+    });
+    await sendTextMessage(
+      client,
+      event.message.chat_id,
+      [`已将 ${alias} 切换到 ${getProviderLabel(provider)}。`, '下一条发给这个会话的消息会使用新的 Agent。'].join('\n')
+    );
+    return true;
+  }
+
   if (command.toLowerCase().startsWith('/new')) {
     const session = await store.createSession(chatKey);
     const parsed = await parseNewCommand(command);
@@ -421,6 +478,7 @@ async function handleCommand(client, event, text) {
         event.message.chat_id,
         [
           `已创建新会话 ${session.alias}。`,
+          `Agent: ${getProviderLabel(session.provider || config.defaultAgentProvider)}`,
           `工作目录: ${session.workspace || config.defaultWorkspace}`,
           '你的首条指令也已收到，马上开始执行。',
           '',
@@ -436,6 +494,7 @@ async function handleCommand(client, event, text) {
       event.message.chat_id,
       [
         `已创建新会话 ${session.alias}。`,
+        `Agent: ${getProviderLabel(session.provider || config.defaultAgentProvider)}`,
         `工作目录: ${session.workspace || config.defaultWorkspace}`,
         '现在直接发送文本，默认会进入这个新会话。',
         '',
@@ -583,9 +642,10 @@ async function queueTurn(client, event, prompt, alias) {
     .then(async () => {
       const session = await store.touchSession(chatKey, alias);
       const workspace = session?.workspace || config.defaultWorkspace;
+      const provider = session?.provider || config.defaultAgentProvider;
       const opening = session?.sessionId
-        ? `已收到，继续 ${alias} 处理中。`
-        : `已收到，正在为你启动新的会话 ${alias}。`;
+        ? `已收到，继续 ${alias}（${getProviderLabel(provider)}）处理中。`
+        : `已收到，正在为你启动新的会话 ${alias}（${getProviderLabel(provider)}）。`;
       await sendTextMessage(client, event.message.chat_id, opening);
 
       await store.appendTurn(chatKey, alias, {
@@ -600,7 +660,8 @@ async function queueTurn(client, event, prompt, alias) {
       });
       const beforeSnapshot = await captureWorkspaceSnapshot(workspace);
 
-      const result = await runCodexTurn({
+      const result = await runAgentTurn({
+        provider,
         sessionId: session?.sessionId || null,
         prompt,
         config: {
@@ -613,6 +674,7 @@ async function queueTurn(client, event, prompt, alias) {
 
       await store.updateSession(chatKey, alias, {
         sessionId: result.sessionId,
+        provider,
         status: 'idle',
         currentTaskPreview: '',
         lastResultPreview: trimPreview(result.output || 'Codex 没有返回正文。', 120),
@@ -642,9 +704,10 @@ async function queueTurn(client, event, prompt, alias) {
         sessionId: result.sessionId || '未知',
         workspace,
         status: 'success',
+        provider,
         branchChange: diff.branchChange,
         commitChange: diff.commitChange,
-        title: 'Codex 结果'
+        title: `${getProviderLabel(provider)} 结果`
       });
     })
     .catch(async (error) => {
