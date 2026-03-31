@@ -1299,6 +1299,12 @@ async function main() {
         const normalizedText = cleanPromptText(rawText, event) || rawText;
         const isGroup = isGroupChat(event);
         const mentioned = isBotMentioned(event);
+        const chatKey = getChatKey(event);
+        const threadSession = resolveSessionFromThread(chatKey, event);
+
+        if (isGroup && !threadSession && !mentioned) {
+          return;
+        }
 
         if (isGroup && mentioned && normalizedText.startsWith('/')) {
           if (await handleCommand(client, event, normalizedText)) {
@@ -1310,8 +1316,6 @@ async function main() {
           return;
         }
 
-        const chatKey = getChatKey(event);
-        const threadSession = resolveSessionFromThread(chatKey, event);
         const cleanedText = normalizedText;
         console.log('[route]', {
           chatId: chatKey,
