@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 
 function normalizeTurns(turns) {
   if (!Array.isArray(turns)) {
@@ -95,6 +96,7 @@ function normalizeChatRecord(chatKey, record) {
 export class SessionStore {
   constructor(dataDir) {
     this.filePath = path.join(dataDir, 'sessions.json');
+    this.lockPath = path.join(dataDir, 'sessions.lock');
     this.sessions = new Map();
     this.ready = false;
   }
@@ -144,26 +146,24 @@ export class SessionStore {
     return record.sessions[alias] || null;
   }
 
-  hasProcessedMessage(chatKey, messageId) {
+  async claimProcessedMessage(chatKey, messageId) {
     if (!messageId) {
-      return false;
+      return true;
     }
-    const record = this.get(chatKey);
-    return record.processedMessageIds.includes(messageId);
-  }
 
-  async registerProcessedMessage(chatKey, messageId) {
-    if (!messageId) {
-      return;
-    }
-    const record = this.get(chatKey);
-    if (!record.processedMessageIds.includes(messageId)) {
+    return this.withFileLock(async () => {
+      await this.reloadFromDisk();
+      const record = this.get(chatKey);
+      if (record.processedMessageIds.includes(messageId)) {
+        return false;
+      }
       record.processedMessageIds.push(messageId);
       if (record.processedMessageIds.length > 200) {
         record.processedMessageIds = record.processedMessageIds.slice(-200);
       }
       await this.flush();
-    }
+      return true;
+    });
   }
 
   findSessionByThreadMarker(chatKey, marker) {
@@ -360,6 +360,50 @@ export class SessionStore {
     this.ensureReady();
     this.sessions.set(chatKey, normalizeChatRecord(chatKey, null));
     await this.flush();
+  }
+
+  async reloadFromDisk() {
+    this.ensureReady();
+    try {
+      const raw = await fs.readFile(this.filePath, 'utf8');
+      const parsed = JSON.parse(raw);
+      this.sessions = new Map(
+        Object.entries(parsed).map(([chatKey, record]) => [chatKey, normalizeChatRecord(chatKey, record)])
+      );
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        throw error;
+      }
+      this.sessions = new Map();
+    }
+  }
+
+  async withFileLock(action, options = {}) {
+    this.ensureReady();
+    const retryDelayMs = options.retryDelayMs ?? 25;
+    const maxAttempts = options.maxAttempts ?? 200;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      let handle = null;
+      try {
+        handle = await fs.open(this.lockPath, 'wx');
+        const result = await action();
+        await handle.close();
+        await fs.unlink(this.lockPath).catch(() => {});
+        return result;
+      } catch (error) {
+        if (handle) {
+          await handle.close().catch(() => {});
+          await fs.unlink(this.lockPath).catch(() => {});
+        }
+        if (error?.code !== 'EEXIST') {
+          throw error;
+        }
+        await sleep(retryDelayMs);
+      }
+    }
+
+    throw new Error(`Failed to acquire session store lock: ${this.lockPath}`);
   }
 
   async flush() {

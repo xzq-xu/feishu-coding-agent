@@ -5,6 +5,7 @@ import path from 'node:path';
 
 import { config } from './config.js';
 import { runAgentTurn } from './agent-runner.js';
+import { acquireSingleInstanceLock } from './process-lock.js';
 import { SessionStore } from './session-store.js';
 import { captureWorkspaceSnapshot, summarizeWorkspaceChanges } from './workspace-diff.js';
 
@@ -19,6 +20,8 @@ const botIdentity = {
   names: new Set()
 };
 let cleanupPromise = Promise.resolve();
+let processLockHandle = null;
+let shutdownStarted = false;
 
 function getJobKey(chatKey, alias) {
   return `${chatKey}::${alias}`;
@@ -1585,6 +1588,7 @@ async function queueTurn(client, event, prompt, alias) {
 }
 
 async function main() {
+  processLockHandle = await acquireSingleInstanceLock(config.dataDir);
   await store.init();
   await fs.mkdir(config.downloadsDir, { recursive: true });
   await scheduleDownloadCleanup();
@@ -1656,14 +1660,14 @@ async function main() {
 
         const incomingMessageId = getMessageId(event);
         const chatKey = getChatKey(event);
-        if (store.hasProcessedMessage(chatKey, incomingMessageId)) {
+        const claimed = await store.claimProcessedMessage(chatKey, incomingMessageId);
+        if (!claimed) {
           console.log('[dedupe-skip]', {
             chatId: message.chat_id,
             messageId: incomingMessageId
           });
           return;
         }
-        await store.registerProcessedMessage(chatKey, incomingMessageId);
 
         const rawText = getTextContent(message.content);
         console.log('[message]', {
@@ -1879,11 +1883,29 @@ async function main() {
   });
 
   process.on('SIGINT', async () => {
-    process.exit(0);
+    await shutdown(0);
   });
+
+  process.on('SIGTERM', async () => {
+    await shutdown(0);
+  });
+}
+
+async function shutdown(code = 0) {
+  if (shutdownStarted) {
+    return;
+  }
+  shutdownStarted = true;
+
+  if (processLockHandle) {
+    await processLockHandle.release().catch(() => {});
+    processLockHandle = null;
+  }
+
+  process.exit(code);
 }
 
 main().catch((error) => {
   console.error(error);
-  process.exit(1);
+  void shutdown(1);
 });
