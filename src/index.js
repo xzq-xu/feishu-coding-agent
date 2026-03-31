@@ -17,6 +17,7 @@ const RECENT_SESSION_LIMIT = 5;
 const botIdentity = {
   names: new Set()
 };
+let cleanupPromise = Promise.resolve();
 
 function getJobKey(chatKey, alias) {
   return `${chatKey}::${alias}`;
@@ -103,6 +104,10 @@ function trimPreview(text, max = 80) {
     return '暂无摘要';
   }
   return normalized.length > max ? `${normalized.slice(0, max - 1)}…` : normalized;
+}
+
+function sanitizeFilename(name) {
+  return (name || 'attachment').replace(/[^a-zA-Z0-9._-]+/g, '_').slice(0, 120) || 'attachment';
 }
 
 function parseSessionAlias(text) {
@@ -388,6 +393,14 @@ function getTextContent(content) {
   }
 }
 
+function parseMessageContent(content) {
+  try {
+    return JSON.parse(content || '{}');
+  } catch {
+    return {};
+  }
+}
+
 function getChatKey(event) {
   return event.message.chat_id;
 }
@@ -473,6 +486,188 @@ function extractMessageBodyText(item) {
   }
   const raw = item.body?.content || item.content || item.message?.content || '';
   return getTextContent(raw);
+}
+
+function getAttachmentPayload(message) {
+  return parseMessageContent(message?.content || '{}');
+}
+
+function extractPostAttachments(message) {
+  const payload = getAttachmentPayload(message);
+  const localeBlock = payload.zh_cn || payload.en_us || payload;
+  const lines = Array.isArray(localeBlock?.content)
+    ? localeBlock.content
+    : Array.isArray(payload?.content)
+      ? payload.content
+      : [];
+  const attachments = [];
+
+  for (const line of lines) {
+    for (const item of Array.isArray(line) ? line : []) {
+      if (!item || typeof item !== 'object') {
+        continue;
+      }
+      if (item.tag === 'img' && item.image_key) {
+        attachments.push({
+          type: 'image',
+          fileKey: item.image_key,
+          name: item.image_name || `image-${Date.now()}.png`
+        });
+      }
+      if (item.tag === 'file' && item.file_key) {
+        attachments.push({
+          type: 'file',
+          fileKey: item.file_key,
+          name: item.file_name || `file-${Date.now()}`
+        });
+      }
+    }
+  }
+
+  return attachments;
+}
+
+function guessAttachmentFilename(message) {
+  const payload = getAttachmentPayload(message);
+  if (typeof payload.file_name === 'string' && payload.file_name.trim()) {
+    return sanitizeFilename(payload.file_name.trim());
+  }
+  if (typeof payload.image_name === 'string' && payload.image_name.trim()) {
+    return sanitizeFilename(payload.image_name.trim());
+  }
+  if (message?.message_type === 'image') {
+    return `image-${Date.now()}.png`;
+  }
+  if (message?.message_type === 'file') {
+    return `file-${Date.now()}`;
+  }
+  return `attachment-${Date.now()}`;
+}
+
+async function listDownloadedFiles(dir) {
+  const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+  const files = [];
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...await listDownloadedFiles(fullPath));
+      continue;
+    }
+    const stat = await fs.stat(fullPath).catch(() => null);
+    if (!stat?.isFile()) {
+      continue;
+    }
+    files.push({
+      path: fullPath,
+      mtimeMs: stat.mtimeMs,
+      size: stat.size
+    });
+  }
+  return files;
+}
+
+async function cleanupDownloads() {
+  const now = Date.now();
+  const ttlMs = config.downloadsTtlHours * 60 * 60 * 1000;
+  const files = await listDownloadedFiles(config.downloadsDir);
+  let remaining = [];
+
+  for (const file of files) {
+    if (ttlMs > 0 && now - file.mtimeMs > ttlMs) {
+      await fs.unlink(file.path).catch(() => {});
+    } else {
+      remaining.push(file);
+    }
+  }
+
+  remaining = remaining.sort((a, b) => a.mtimeMs - b.mtimeMs);
+  let totalBytes = remaining.reduce((sum, file) => sum + file.size, 0);
+  for (const file of remaining) {
+    if (totalBytes <= config.downloadsMaxBytes) {
+      break;
+    }
+    await fs.unlink(file.path).catch(() => {});
+    totalBytes -= file.size;
+  }
+}
+
+function scheduleDownloadCleanup() {
+  cleanupPromise = cleanupPromise
+    .catch(() => {})
+    .then(() => cleanupDownloads())
+    .catch((error) => logRuntime('downloads-cleanup-failed', {
+      error: error?.message || '未知错误'
+    }));
+  return cleanupPromise;
+}
+
+async function downloadMessageAttachment(client, event) {
+  const message = event?.message;
+  if (!message?.message_id) {
+    return [];
+  }
+
+  await fs.mkdir(config.downloadsDir, { recursive: true });
+  await scheduleDownloadCleanup();
+
+  const chatDir = path.join(config.downloadsDir, sanitizeFilename(message.chat_id || 'chat'));
+  await fs.mkdir(chatDir, { recursive: true });
+  const payload = getAttachmentPayload(message);
+  const directFileKey = payload.file_key || payload.image_key || null;
+  const directItems = directFileKey ? [{
+    type: message.message_type,
+    fileKey: directFileKey,
+    name: guessAttachmentFilename(message)
+  }] : [];
+  const items = message.message_type === 'post' ? extractPostAttachments(message) : directItems;
+  const downloads = [];
+
+  for (const item of items) {
+    const filePath = path.join(chatDir, `${Date.now()}-${sanitizeFilename(item.name)}`);
+    try {
+      const resource = await client.im.v1.messageResource.get({
+        path: {
+          message_id: message.message_id,
+          file_key: item.fileKey
+        },
+        params: {
+          type: item.type
+        }
+      });
+      await resource.writeFile(filePath);
+      downloads.push({
+        type: item.type,
+        path: filePath
+      });
+    } catch (error) {
+      await logRuntime('attachment-download-failed', {
+        messageId: message.message_id,
+        messageType: message.message_type,
+        itemType: item.type,
+        fileKey: item.fileKey,
+        request: {
+          type: item.type
+        },
+        error: error?.message || '未知错误',
+        response: error?.response?.data || null,
+        status: error?.response?.status || null
+      });
+      throw error;
+    }
+  }
+
+  await scheduleDownloadCleanup();
+  return downloads;
+}
+
+function buildAttachmentPrompt(attachments, text = '') {
+  const lines = attachments.map((item) => `- [${item.type}] ${item.path}`);
+  return [
+    text.trim() || '用户发来了一些附件，请优先查看这些本地文件。',
+    '',
+    '附件已下载到本地，请直接使用这些绝对路径：',
+    ...lines
+  ].join('\n');
 }
 
 function getMessageThreadMarkers(item) {
@@ -1225,6 +1420,8 @@ async function queueTurn(client, event, prompt, alias) {
 
 async function main() {
   await store.init();
+  await fs.mkdir(config.downloadsDir, { recursive: true });
+  await scheduleDownloadCleanup();
 
   const client = new Lark.Client({
     appId: config.feishuAppId,
@@ -1279,8 +1476,8 @@ async function main() {
           return;
         }
 
-        if (!['text', 'post'].includes(message.message_type)) {
-          await sendTextMessage(client, message.chat_id, '当前 MVP 目前只支持文本和富文本消息。');
+        if (!['text', 'post', 'image', 'file'].includes(message.message_type)) {
+          await sendTextMessage(client, message.chat_id, '当前 MVP 目前只支持文本、富文本、图片和文件消息。');
           return;
         }
 
@@ -1290,11 +1487,12 @@ async function main() {
         }
 
         const rawText = getTextContent(message.content);
-        console.log('[message]', { chatId: message.chat_id, text: rawText });
-        if (!rawText) {
-          await sendTextMessage(client, message.chat_id, '没有解析到文本内容，请直接发送文本消息。');
-          return;
-        }
+        console.log('[message]', {
+          chatId: message.chat_id,
+          text: rawText,
+          attachments: [],
+          content: rawText ? undefined : message.content
+        });
 
         const normalizedText = cleanPromptText(rawText, event) || rawText;
         const isGroup = isGroupChat(event);
@@ -1304,6 +1502,20 @@ async function main() {
 
         if (isGroup && !threadSession && !mentioned) {
           return;
+        }
+
+        const attachmentMessages = ['image', 'file', 'post'].includes(message.message_type)
+          ? await downloadMessageAttachment(client, event)
+          : [];
+        if (!rawText && !attachmentMessages.length) {
+          await sendTextMessage(client, message.chat_id, '没有解析到可处理的文本或附件内容。');
+          return;
+        }
+        if (attachmentMessages.length) {
+          console.log('[attachments]', {
+            chatId: message.chat_id,
+            files: attachmentMessages.map((item) => item.path)
+          });
         }
 
         if (isGroup && mentioned && normalizedText.startsWith('/')) {
@@ -1316,7 +1528,9 @@ async function main() {
           return;
         }
 
-        const cleanedText = normalizedText;
+        const cleanedText = attachmentMessages.length
+          ? buildAttachmentPrompt(attachmentMessages, normalizedText)
+          : normalizedText;
         console.log('[route]', {
           chatId: chatKey,
           isGroup,
@@ -1400,7 +1614,7 @@ async function main() {
 
           const target = threadSession || await store.ensureActiveSession(chatKey);
           alias = target.alias;
-          prompt = text;
+          prompt = cleanedText;
           }
         }
 

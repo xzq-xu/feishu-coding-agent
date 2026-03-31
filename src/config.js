@@ -21,6 +21,15 @@ function readBoolean(name, fallback) {
   return ['1', 'true', 'yes', 'on'].includes(value.toLowerCase());
 }
 
+function readNumber(name, fallback) {
+  const value = process.env[name];
+  if (value == null || value === '') {
+    return fallback;
+  }
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
 export const config = {
   feishuAppId: readRequired('FEISHU_APP_ID'),
   feishuAppSecret: readRequired('FEISHU_APP_SECRET'),
@@ -41,5 +50,8 @@ export const config = {
   opencodeBin: process.env.OPENCODE_BIN || 'opencode',
   opencodeModel: process.env.OPENCODE_MODEL || '',
   botLocale: process.env.BOT_LOCALE || 'zh-CN',
-  dataDir: path.resolve(process.cwd(), 'data')
+  dataDir: path.resolve(process.cwd(), 'data'),
+  downloadsDir: path.resolve(process.cwd(), 'data', 'downloads'),
+  downloadsTtlHours: readNumber('DOWNLOAD_TTL_HOURS', 72),
+  downloadsMaxBytes: readNumber('DOWNLOAD_MAX_BYTES', 1024 * 1024 * 1024)
 };
