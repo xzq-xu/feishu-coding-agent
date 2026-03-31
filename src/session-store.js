@@ -22,6 +22,7 @@ function normalizeSession(alias, session) {
     sessionId: session?.sessionId || null,
     rootMessageId: session?.rootMessageId || null,
     messageIds: Array.isArray(session?.messageIds) ? session.messageIds.filter((id) => typeof id === 'string' && id) : [],
+    threadIds: Array.isArray(session?.threadIds) ? session.threadIds.filter((id) => typeof id === 'string' && id) : [],
     provider: session?.provider || 'codex',
     title: session?.title || alias,
     workspace: session?.workspace || null,
@@ -138,13 +139,15 @@ export class SessionStore {
     return record.sessions[alias] || null;
   }
 
-  findSessionByRootMessageId(chatKey, rootMessageId) {
-    if (!rootMessageId) {
+  findSessionByThreadMarker(chatKey, marker) {
+    if (!marker) {
       return null;
     }
     const record = this.get(chatKey);
     return Object.values(record.sessions).find((session) => (
-      session.rootMessageId === rootMessageId || session.messageIds.includes(rootMessageId)
+      session.rootMessageId === marker ||
+      session.messageIds.includes(marker) ||
+      session.threadIds.includes(marker)
     )) || null;
   }
 
@@ -161,6 +164,26 @@ export class SessionStore {
       session.messageIds.push(messageId);
       if (session.messageIds.length > 50) {
         session.messageIds = session.messageIds.slice(-50);
+      }
+      session.updatedAt = new Date().toISOString();
+      await this.flush();
+    }
+    return session;
+  }
+
+  async registerThreadId(chatKey, alias, threadId) {
+    if (!threadId) {
+      return null;
+    }
+    const record = this.get(chatKey);
+    const session = record.sessions[alias];
+    if (!session) {
+      throw new Error(`Unknown session alias: ${alias}`);
+    }
+    if (!session.threadIds.includes(threadId)) {
+      session.threadIds.push(threadId);
+      if (session.threadIds.length > 20) {
+        session.threadIds = session.threadIds.slice(-20);
       }
       session.updatedAt = new Date().toISOString();
       await this.flush();

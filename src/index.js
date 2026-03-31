@@ -361,9 +361,13 @@ function getSenderOpenId(event) {
   return event.sender?.sender_id?.open_id || '';
 }
 
-function getThreadRootMessageId(event) {
+function getThreadMarkers(event) {
   const message = event?.message;
-  return message?.root_id || message?.parent_id || null;
+  return [
+    message?.root_id || null,
+    message?.parent_id || null,
+    message?.thread_id || null
+  ].filter(Boolean);
 }
 
 function getMessageId(event) {
@@ -502,10 +506,16 @@ async function sendResultCard(client, chatId, payload, replyToMessageId = null) 
 
 async function registerOutboundMessage(chatKey, alias, responseData) {
   const messageId = responseData?.message_id;
-  if (!messageId) {
+  const threadId = responseData?.thread_id;
+  if (!messageId && !threadId) {
     return;
   }
-  await store.registerMessageId(chatKey, alias, messageId).catch(() => {});
+  if (messageId) {
+    await store.registerMessageId(chatKey, alias, messageId).catch(() => {});
+  }
+  if (threadId) {
+    await store.registerThreadId(chatKey, alias, threadId).catch(() => {});
+  }
 }
 
 async function resetSession(client, event) {
@@ -563,17 +573,23 @@ async function ensureSessionRootMessage(client, event, chatKey, session, options
   if (rootMessageId) {
     await store.updateSession(chatKey, session.alias, { rootMessageId });
     await store.registerMessageId(chatKey, session.alias, rootMessageId);
+    if (created?.thread_id) {
+      await store.registerThreadId(chatKey, session.alias, created.thread_id);
+    }
     session.rootMessageId = rootMessageId;
   }
   return rootMessageId;
 }
 
 function resolveSessionFromThread(chatKey, event) {
-  const rootMessageId = getThreadRootMessageId(event);
-  if (!rootMessageId) {
-    return null;
+  const markers = getThreadMarkers(event);
+  for (const marker of markers) {
+    const session = store.findSessionByThreadMarker(chatKey, marker);
+    if (session) {
+      return session;
+    }
   }
-  return store.findSessionByRootMessageId(chatKey, rootMessageId);
+  return null;
 }
 
 async function handleCommand(client, event, text) {
@@ -1030,7 +1046,12 @@ async function main() {
         console.log('[event]', {
           type: 'im.message.receive_v1',
           chatId: message?.chat_id,
+          chatType: message?.chat_type,
           messageType: message?.message_type,
+          messageId: message?.message_id,
+          rootId: message?.root_id || null,
+          parentId: message?.parent_id || null,
+          threadId: message?.thread_id || null,
           senderOpenId: getSenderOpenId(event)
         });
 
@@ -1061,6 +1082,12 @@ async function main() {
 
         const chatKey = getChatKey(event);
         const threadSession = resolveSessionFromThread(chatKey, event);
+        console.log('[route]', {
+          chatId: chatKey,
+          markers: getThreadMarkers(event),
+          threadSession: threadSession?.alias || null,
+          activeAlias: store.get(chatKey).activeAlias || null
+        });
         const prefixed = parseSessionPrefixedPrompt(text);
         let alias;
         let prompt;
@@ -1074,6 +1101,16 @@ async function main() {
             return;
           }
         } else {
+          const sessions = store.listSessions(chatKey);
+          if (!threadSession && sessions.length > 1) {
+            await sendTextMessage(
+              client,
+              message.chat_id,
+              '这条消息没有识别到对应的话题上下文。为了避免串到别的会话，请直接回复对应线程里的消息，或使用 `S1: 你的指令` 这种写法。'
+            );
+            return;
+          }
+
           const target = threadSession || await store.ensureActiveSession(chatKey);
           alias = target.alias;
           prompt = text;
