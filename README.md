@@ -14,7 +14,7 @@
 - 同一聊天里可保留多个会话
 - 每个会话可绑定自己的工作目录
 - 每个会话都会显示状态：空闲 / 运行中 / 已完成 / 失败
-- 每个会话都可以独立选择 Agent：Codex / Claude Code / Cursor Agent / OpenCode
+- 每个会话都可以在创建时指定 Agent：Codex / Claude Code / Cursor Agent / OpenCode
 - 每次结果里自动附带最近活跃的几个会话摘要
 - 每次结果会直接以一张卡片发送，卡片里同时展示结果、会话信息和可用命令
 - 每个新会话都会生成一条主消息，后续结果会回复到这条消息下面，便于按话题管理
@@ -30,9 +30,6 @@
 - `/thread` 为当前会话创建或刷新一个话题入口
 - `/thread S1` 为指定旧会话创建或刷新一个话题入口
 - `/agent` 查看当前活跃会话使用的 Agent
-- `/agent claude` 将当前活跃会话切换到 Claude Code
-- `/agent S1 cursor` 将指定会话切换到 Cursor Agent
-- `/agent S1 opencode` 将指定会话切换到 OpenCode
 - `/cwd` 查看当前活跃会话的工作目录
 - `/cwd /path/to/project` 修改当前活跃会话的工作目录
 - `/cwd S1 /path/to/project` 修改指定会话的工作目录
@@ -140,22 +137,12 @@ npm start
 
 其中空闲会话会明确标成 `空闲`，方便你快速挑一个继续推进，不让它闲着。
 
-如果你想切换某个会话使用的 Agent：
+已创建的会话不支持中途切换 Agent。
+这是为了避免底层 Agent 自己的会话上下文丢失或串线。
+如果你想换 Agent，请直接新建一个会话：
 
 ```text
-/agent S1 claude
-```
-
-或者：
-
-```text
-/agent S1 cursor
-```
-
-或者：
-
-```text
-/agent S1 opencode
+/new claude /Users/xzq/project-a 你的第一条指令
 ```
 
 如果你想新开一个话题：

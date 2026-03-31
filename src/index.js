@@ -381,9 +381,6 @@ function formatHelp() {
     '直接发送文本：发给当前活跃会话',
     'S1: 继续优化这个方案：把消息发给指定会话',
     '/agent：查看当前活跃会话使用的 Agent',
-    '/agent claude：把当前活跃会话切到 Claude Code',
-    '/agent S1 cursor：把指定会话切到 Cursor Agent',
-    '/agent S1 opencode：把指定会话切到 OpenCode',
     '/new：创建一个新的会话，并设为当前活跃',
     '/new cursor：创建一个使用 Cursor Agent 的新会话',
     '/new cursor /path/to/project：创建新会话并同时指定 Agent 和目录',
@@ -619,23 +616,14 @@ async function handleCommand(client, event, text) {
 
   const agentMatch = command.match(/^\/agent(?:\s+(S\d+))?\s+(codex|claude|cursor|opencode)$/i);
   if (agentMatch) {
-    const alias = agentMatch[1]?.toUpperCase() || (await store.ensureActiveSession(chatKey)).alias;
-    const provider = agentMatch[2].toLowerCase();
-    const session = store.getSession(chatKey, alias);
-    if (!session) {
-      await sendTextMessage(client, event.message.chat_id, `没有找到 ${alias}。发送 /sessions 看最近会话。`);
-      return true;
-    }
-    await store.updateSession(chatKey, alias, {
-      provider,
-      sessionId: null,
-      status: 'idle',
-      currentTaskPreview: ''
-    });
     await sendTextMessage(
       client,
       event.message.chat_id,
-      [`已将 ${alias} 切换到 ${getProviderLabel(provider)}。`, '下一条发给这个会话的消息会使用新的 Agent。'].join('\n')
+      [
+        '已创建的会话不支持切换 Agent。',
+        '这是为了避免底层会话上下文丢失或串线。',
+        `请使用 \`/new ${agentMatch[2].toLowerCase()} /path/to/project 你的第一条指令\` 新建一个对应 Agent 的会话。`
+      ].join('\n')
     );
     return true;
   }
