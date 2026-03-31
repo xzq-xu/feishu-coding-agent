@@ -11,6 +11,11 @@ import { captureWorkspaceSnapshot, summarizeWorkspaceChanges } from './workspace
 const store = new SessionStore(config.dataDir);
 const activeJobs = new Map();
 const runtimeLogPath = path.join(config.dataDir, 'runtime.log');
+const RECENT_SESSION_LIMIT = 5;
+
+function getJobKey(chatKey, alias) {
+  return `${chatKey}::${alias}`;
+}
 
 async function logRuntime(message, details = null) {
   const line = [
@@ -67,6 +72,11 @@ function getProviderLabel(provider) {
   }
 }
 
+function hasRunningJob(chatKey) {
+  const prefix = `${chatKey}::`;
+  return Array.from(activeJobs.keys()).some((key) => key.startsWith(prefix));
+}
+
 function trimPreview(text, max = 80) {
   const normalized = (text || '').replace(/\s+/g, ' ').trim();
   if (!normalized) {
@@ -92,6 +102,10 @@ function parseSessionPrefixedPrompt(text) {
   };
 }
 
+function isAgentProviderToken(token) {
+  return ['codex', 'claude', 'cursor', 'opencode'].includes((token || '').toLowerCase());
+}
+
 function tokenizeCommandArgs(input) {
   const matches = input.match(/"([^"]+)"|'([^']+)'|[^\s]+/g) || [];
   return matches.map((token) => {
@@ -107,7 +121,7 @@ function tokenizeCommandArgs(input) {
 
 function formatRecentSessions(chatKey) {
   const record = store.get(chatKey);
-  const sessions = store.listSessions(chatKey).slice(0, 3);
+  const sessions = store.listSessions(chatKey).slice(0, RECENT_SESSION_LIMIT);
   if (!sessions.length) {
     return '最近会话: 暂无';
   }
@@ -129,7 +143,7 @@ function formatRecentSessions(chatKey) {
 
 function buildResultCard({ chatKey, alias, output, sessionId, workspace, status = 'idle', provider = 'codex', branchChange = null, commitChange = null, title = 'Agent 结果' }) {
   const record = store.get(chatKey);
-  const sessions = store.listSessions(chatKey).slice(0, 3);
+  const sessions = store.listSessions(chatKey).slice(0, RECENT_SESSION_LIMIT);
   const elements = [
     {
       tag: 'markdown',
@@ -210,12 +224,13 @@ function formatSessionTranscript(session, limit = 10) {
 
   const lines = [
     `${session.alias} 最近 ${recentTurns.length} 条消息:`,
+    `Agent: ${getProviderLabel(session.provider)}`,
     `状态: ${getStatusLabel(session.status)}`,
     `工作目录: ${session.workspace || config.defaultWorkspace}`
   ];
 
   for (const turn of recentTurns) {
-    const label = turn.role === 'assistant' ? 'Codex' : '你';
+    const label = turn.role === 'assistant' ? getProviderLabel(session.provider) : '你';
     lines.push('');
     lines.push(`${label}: ${turn.text}`);
   }
@@ -293,26 +308,38 @@ async function resolveWorkspaceInput(input) {
 async function parseNewCommand(command) {
   const rest = command.replace(/^\/new\b/i, '').trim();
   if (!rest) {
-    return { workspace: null, prompt: '' };
+    return { provider: null, workspace: null, prompt: '' };
   }
 
   const tokens = tokenizeCommandArgs(rest);
   if (!tokens.length) {
-    return { workspace: null, prompt: '' };
+    return { provider: null, workspace: null, prompt: '' };
   }
 
-  for (let count = tokens.length; count >= 1; count -= 1) {
-    const candidate = tokens.slice(0, count).join(' ');
+  let provider = null;
+  let startIndex = 0;
+  if (isAgentProviderToken(tokens[0])) {
+    provider = tokens[0].toLowerCase();
+    startIndex = 1;
+  }
+
+  const remainingTokens = tokens.slice(startIndex);
+  if (!remainingTokens.length) {
+    return { provider, workspace: null, prompt: '' };
+  }
+
+  for (let count = remainingTokens.length; count >= 1; count -= 1) {
+    const candidate = remainingTokens.slice(0, count).join(' ');
     try {
       const workspace = await resolveWorkspaceInput(candidate);
-      const prompt = rest.slice(candidate.length).trim();
-      return { workspace, prompt };
+      const prompt = remainingTokens.slice(count).join(' ').trim();
+      return { provider, workspace, prompt };
     } catch {
       // Keep trying shorter prefixes until one resolves to a real directory.
     }
   }
 
-  return { workspace: null, prompt: rest };
+  return { provider, workspace: null, prompt: remainingTokens.join(' ').trim() };
 }
 
 function getTextContent(content) {
@@ -343,6 +370,9 @@ function formatHelp() {
     '/agent S1 cursor：把指定会话切到 Cursor Agent',
     '/agent S1 opencode：把指定会话切到 OpenCode',
     '/new：创建一个新的会话，并设为当前活跃',
+    '/new cursor：创建一个使用 Cursor Agent 的新会话',
+    '/new cursor /path/to/project：创建新会话并同时指定 Agent 和目录',
+    '/new cursor /path/to/project 你的第一条指令：创建新会话并立即开始',
     '/cwd：查看当前活跃会话的工作目录',
     '/cwd /path/to/project：修改当前活跃会话的工作目录',
     '/cwd S1 /path/to/project：修改指定会话的工作目录',
@@ -377,7 +407,7 @@ function formatUnknownCommand(command) {
 
 function formatStatus(chatKey) {
   const record = store.get(chatKey);
-  const running = activeJobs.get(chatKey);
+  const running = hasRunningJob(chatKey);
   const idleSessions = store.listSessions(chatKey).filter((session) => session.status === 'idle');
   return [
     `聊天: ${chatKey}`,
@@ -479,8 +509,17 @@ async function handleCommand(client, event, text) {
   }
 
   if (command.toLowerCase().startsWith('/new')) {
-    const session = await store.createSession(chatKey);
     const parsed = await parseNewCommand(command);
+    const session = await store.createSession(chatKey);
+    if (parsed.provider) {
+      await store.updateSession(chatKey, session.alias, {
+        provider: parsed.provider,
+        sessionId: null,
+        status: 'idle',
+        currentTaskPreview: ''
+      });
+      session.provider = parsed.provider;
+    }
     if (parsed.workspace) {
       await store.updateSession(chatKey, session.alias, { workspace: parsed.workspace });
       session.workspace = parsed.workspace;
@@ -649,7 +688,8 @@ async function handleCommand(client, event, text) {
 
 async function queueTurn(client, event, prompt, alias) {
   const chatKey = getChatKey(event);
-  const prior = activeJobs.get(chatKey) || Promise.resolve();
+  const jobKey = getJobKey(chatKey, alias);
+  const prior = activeJobs.get(jobKey) || Promise.resolve();
 
   const next = prior
     .catch(() => {})
@@ -759,12 +799,12 @@ async function queueTurn(client, event, prompt, alias) {
       );
     })
     .finally(() => {
-      if (activeJobs.get(chatKey) === next) {
-        activeJobs.delete(chatKey);
+      if (activeJobs.get(jobKey) === next) {
+        activeJobs.delete(jobKey);
       }
     });
 
-  activeJobs.set(chatKey, next);
+  activeJobs.set(jobKey, next);
   await next;
 }
 

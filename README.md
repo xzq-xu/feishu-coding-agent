@@ -21,8 +21,11 @@
 - 如果本轮发生了分支切换或提交变化，也会直接显示在结果卡片里
 - `S1: 继续处理` 这种前缀可把消息发给指定会话
 - `/new` 创建新会话
+- `/new cursor` 创建新会话并直接指定 Agent
 - `/new /path/to/project` 创建新会话并直接指定工作目录
+- `/new cursor /path/to/project` 创建新会话并同时指定 Agent 和工作目录
 - `/new /path/to/project 你的第一条指令` 创建新会话、指定目录并立即开始第一轮
+- `/new cursor /path/to/project 你的第一条指令` 创建新会话、指定 Agent、指定目录并立即开始第一轮
 - `/agent` 查看当前活跃会话使用的 Agent
 - `/agent claude` 将当前活跃会话切换到 Claude Code
 - `/agent S1 cursor` 将指定会话切换到 Cursor Agent
@@ -155,16 +158,34 @@ npm start
 
 然后直接发新消息即可。
 
+如果你想新建会话时直接指定 Agent：
+
+```text
+/new cursor
+```
+
 如果你想新建会话时直接指定目录：
 
 ```text
 /new /Users/xzq/project-a
 ```
 
+如果你想新建会话时同时指定 Agent 和目录：
+
+```text
+/new cursor /Users/xzq/project-a
+```
+
 如果你想新建会话、指定目录并立刻开始：
 
 ```text
 /new /Users/xzq/project-a 帮我分析这个仓库的测试失败原因
+```
+
+如果你想新建会话、指定 Agent、指定目录并立刻开始：
+
+```text
+/new cursor /Users/xzq/project-a 帮我分析这个仓库的测试失败原因
 ```
 
 如果你想切换当前会话的工作目录：
@@ -229,7 +250,7 @@ data/sessions.json     运行时自动生成
 
 ## 已知限制
 
-- 当前最近会话摘要默认展示前 3 个
+- 当前最近会话摘要默认展示前 5 个
 - `/show S1` 当前只展示最近 10 条文本消息
 - `/diff S1` 会优先比较 git 提交点前后差异，再回退到工作区前后快照；非 git 目录下无法提供代码 diff 摘要
 - 删除会话后，剩余会话会自动重排编号
