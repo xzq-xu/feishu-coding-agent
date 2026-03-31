@@ -107,6 +107,7 @@ async function runCodexTurn({ sessionId, prompt, config, workspace }) {
     env: process.env,
     stdio: ['ignore', 'pipe', 'pipe']
   });
+  config.onSpawn?.(child);
 
   let threadId = sessionId || null;
   let lastAgentMessage = '';
@@ -162,6 +163,7 @@ async function runPrintAgent({ provider, bin, args, workspace, sessionId }) {
     env: process.env,
     stdio: ['ignore', 'pipe', 'pipe']
   });
+  config.onSpawn?.(child);
 
   let stdout = '';
   let stderr = '';
@@ -199,6 +201,7 @@ async function runTextAgent({ provider, bin, args, workspace, sessionId }) {
     env: process.env,
     stdio: ['ignore', 'pipe', 'pipe']
   });
+  config.onSpawn?.(child);
 
   let stdout = '';
   let stderr = '';

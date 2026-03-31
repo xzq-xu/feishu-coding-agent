@@ -10,6 +10,8 @@ import { captureWorkspaceSnapshot, summarizeWorkspaceChanges } from './workspace
 
 const store = new SessionStore(config.dataDir);
 const activeJobs = new Map();
+const activeProcesses = new Map();
+const stopRequests = new Set();
 const runtimeLogPath = path.join(config.dataDir, 'runtime.log');
 const RECENT_SESSION_LIMIT = 5;
 
@@ -77,6 +79,21 @@ function hasRunningJob(chatKey) {
   return Array.from(activeJobs.keys()).some((key) => key.startsWith(prefix));
 }
 
+function isSessionActivelyRunning(chatKey, alias) {
+  const jobKey = getJobKey(chatKey, alias);
+  return activeJobs.has(jobKey) || activeProcesses.has(jobKey);
+}
+
+function getEffectiveSessionStatus(chatKey, session) {
+  if (!session) {
+    return 'idle';
+  }
+  if (session.status === 'running' && !isSessionActivelyRunning(chatKey, session.alias)) {
+    return 'idle';
+  }
+  return session.status || 'idle';
+}
+
 function trimPreview(text, max = 80) {
   const normalized = (text || '').replace(/\s+/g, ' ').trim();
   if (!normalized) {
@@ -128,15 +145,16 @@ function formatRecentSessions(chatKey) {
 
   const lines = ['最近会话:'];
   for (const session of sessions) {
+    const effectiveStatus = getEffectiveSessionStatus(chatKey, session);
     const activeMark = record.activeAlias === session.alias ? ' *' : '';
     const preview = trimPreview(
-      session.status === 'running'
+      effectiveStatus === 'running'
         ? session.currentTaskPreview || session.lastUserMessage || session.title
         : session.lastResultPreview || session.lastAssistantMessage || session.lastUserMessage || session.title,
       60
     );
     const workspace = session.workspace ? ` @ ${trimPreview(session.workspace, 36)}` : '';
-    lines.push(`${session.alias}${activeMark} ${getStatusBadge(session.status)} [${getProviderLabel(session.provider)}] ${preview}${workspace}`);
+    lines.push(`${session.alias}${activeMark} ${getStatusBadge(effectiveStatus)} [${getProviderLabel(session.provider)}] ${preview}${workspace}`);
   }
   return lines.join('\n');
 }
@@ -174,9 +192,10 @@ function buildResultCard({ chatKey, alias, output, sessionId, workspace, status 
     });
 
     for (const session of sessions) {
+      const effectiveStatus = getEffectiveSessionStatus(chatKey, session);
       const isActive = record.activeAlias === session.alias;
       const preview = trimPreview(
-        session.status === 'running'
+        effectiveStatus === 'running'
           ? session.currentTaskPreview || session.lastUserMessage || session.title
           : session.lastResultPreview || session.lastAssistantMessage || session.lastUserMessage || session.title,
         80
@@ -184,7 +203,7 @@ function buildResultCard({ chatKey, alias, output, sessionId, workspace, status 
       const sessionWorkspace = trimPreview(session.workspace || config.defaultWorkspace, 50);
       elements.push({
         tag: 'markdown',
-        content: `**${session.alias}${isActive ? ' · 当前' : ''} · ${getStatusLabel(session.status)} · ${getProviderLabel(session.provider)}**\n${preview}\n目录: \`${sessionWorkspace}\``
+        content: `**${session.alias}${isActive ? ' · 当前' : ''} · ${getStatusLabel(effectiveStatus)} · ${getProviderLabel(session.provider)}**\n${preview}\n目录: \`${sessionWorkspace}\``
       });
     }
   }
@@ -216,7 +235,7 @@ function buildResultCard({ chatKey, alias, output, sessionId, workspace, status 
   };
 }
 
-function formatSessionTranscript(session, limit = 10) {
+function formatSessionTranscript(chatKey, session, limit = 10) {
   const recentTurns = session.turns.slice(-limit);
   if (!recentTurns.length) {
     return `${session.alias} 暂无消息记录。`;
@@ -225,7 +244,7 @@ function formatSessionTranscript(session, limit = 10) {
   const lines = [
     `${session.alias} 最近 ${recentTurns.length} 条消息:`,
     `Agent: ${getProviderLabel(session.provider)}`,
-    `状态: ${getStatusLabel(session.status)}`,
+    `状态: ${getStatusLabel(getEffectiveSessionStatus(chatKey, session))}`,
     `工作目录: ${session.workspace || config.defaultWorkspace}`
   ];
 
@@ -238,17 +257,17 @@ function formatSessionTranscript(session, limit = 10) {
   return lines.join('\n');
 }
 
-function formatWorkspaceStatus(session) {
+function formatWorkspaceStatus(chatKey, session) {
   return [
     `会话: ${session.alias}`,
     `Agent: ${getProviderLabel(session.provider)}`,
-    `状态: ${getStatusLabel(session.status)}`,
+    `状态: ${getStatusLabel(getEffectiveSessionStatus(chatKey, session))}`,
     `工作目录: ${session.workspace || config.defaultWorkspace}`,
     session.lastChangedFiles?.length ? `最近改动文件数: ${session.lastChangedFiles.length}` : null
   ].join('\n');
 }
 
-function formatDiffDetails(session) {
+function formatDiffDetails(chatKey, session) {
   if (!session) {
     return '没有找到对应会话。';
   }
@@ -256,7 +275,7 @@ function formatDiffDetails(session) {
   const lines = [
     `会话: ${session.alias}`,
     `Agent: ${getProviderLabel(session.provider)}`,
-    `状态: ${getStatusLabel(session.status)}`,
+    `状态: ${getStatusLabel(getEffectiveSessionStatus(chatKey, session))}`,
     `工作目录: ${session.workspace || config.defaultWorkspace}`
   ];
 
@@ -376,6 +395,8 @@ function formatHelp() {
     '/cwd：查看当前活跃会话的工作目录',
     '/cwd /path/to/project：修改当前活跃会话的工作目录',
     '/cwd S1 /path/to/project：修改指定会话的工作目录',
+    '/stop：停止当前正在运行的会话',
+    '/stop S1：停止指定会话',
     '/delete：删除当前活跃会话',
     '/delete S1：删除指定会话，并自动整理编号',
     '/show S1：查看某个会话最近 10 条消息',
@@ -396,6 +417,7 @@ function formatUnknownCommand(command) {
     '可用命令:',
     '/new',
     '/cwd',
+    '/stop',
     '/delete',
     '/show S1',
     '/diff S1',
@@ -459,6 +481,36 @@ async function resetSession(client, event) {
   const chatKey = getChatKey(event);
   await store.resetChat(chatKey);
   await sendTextMessage(client, event.message.chat_id, '已清空当前聊天的所有会话。下一条消息会新开 S1。');
+}
+
+async function stopSessionRun(chatKey, alias) {
+  const jobKey = getJobKey(chatKey, alias);
+  const child = activeProcesses.get(jobKey);
+  if (!child) {
+    return false;
+  }
+
+  stopRequests.add(jobKey);
+  try {
+    child.kill('SIGTERM');
+  } catch {
+    // Ignore termination errors.
+  }
+
+  const timer = setTimeout(() => {
+    const stillRunning = activeProcesses.get(jobKey);
+    if (stillRunning) {
+      try {
+        stillRunning.kill('SIGKILL');
+      } catch {
+        // Ignore force-kill errors.
+      }
+    }
+  }, 1500);
+  timer.unref?.();
+
+  await logRuntime('agent-turn-stop-requested', { chatKey, alias });
+  return true;
 }
 
 async function handleCommand(client, event, text) {
@@ -559,7 +611,62 @@ async function handleCommand(client, event, text) {
 
   if (command.toLowerCase() === '/cwd') {
     const session = await store.ensureActiveSession(chatKey);
-    await sendTextMessage(client, event.message.chat_id, formatWorkspaceStatus(session));
+    await sendTextMessage(client, event.message.chat_id, formatWorkspaceStatus(chatKey, session));
+    return true;
+  }
+
+  if (command.toLowerCase() === '/stop') {
+    const activeAlias = store.get(chatKey).activeAlias;
+    if (!activeAlias) {
+      await sendTextMessage(client, event.message.chat_id, '当前没有可停止的会话。');
+      return true;
+    }
+    const stopped = await stopSessionRun(chatKey, activeAlias);
+    if (!stopped) {
+      const activeSession = store.getSession(chatKey, activeAlias);
+      if (activeSession?.status === 'running') {
+        await store.updateSession(chatKey, activeAlias, {
+          status: 'idle',
+          currentTaskPreview: '',
+          lastResultPreview: '已清理陈旧的运行中状态。',
+          lastFinishedAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        });
+        await sendTextMessage(client, event.message.chat_id, `${activeAlias} 没有检测到真实运行进程，已清理陈旧的运行中状态。`);
+        return true;
+      }
+      await sendTextMessage(client, event.message.chat_id, `${activeAlias} 当前没有运行中的任务。`);
+      return true;
+    }
+    await sendTextMessage(client, event.message.chat_id, `已请求停止 ${activeAlias}，稍后会释放这个会话。`);
+    return true;
+  }
+
+  const stopMatch = command.match(/^\/stop\s+(S\d+)$/i);
+  if (stopMatch) {
+    const alias = stopMatch[1].toUpperCase();
+    const session = store.getSession(chatKey, alias);
+    if (!session) {
+      await sendTextMessage(client, event.message.chat_id, `没有找到 ${alias}。发送 /sessions 看最近会话。`);
+      return true;
+    }
+    const stopped = await stopSessionRun(chatKey, alias);
+    if (!stopped) {
+      if (session.status === 'running') {
+        await store.updateSession(chatKey, alias, {
+          status: 'idle',
+          currentTaskPreview: '',
+          lastResultPreview: '已清理陈旧的运行中状态。',
+          lastFinishedAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        });
+        await sendTextMessage(client, event.message.chat_id, `${alias} 没有检测到真实运行进程，已清理陈旧的运行中状态。`);
+        return true;
+      }
+      await sendTextMessage(client, event.message.chat_id, `${alias} 当前没有运行中的任务。`);
+      return true;
+    }
+    await sendTextMessage(client, event.message.chat_id, `已请求停止 ${alias}，稍后会释放这个会话。`);
     return true;
   }
 
@@ -647,7 +754,7 @@ async function handleCommand(client, event, text) {
       await sendTextMessage(client, event.message.chat_id, `没有找到 ${alias}。发送 /sessions 看最近会话。`);
       return true;
     }
-    await sendTextMessage(client, event.message.chat_id, formatSessionTranscript(session, 10));
+    await sendTextMessage(client, event.message.chat_id, formatSessionTranscript(chatKey, session, 10));
     return true;
   }
 
@@ -663,7 +770,7 @@ async function handleCommand(client, event, text) {
       await sendTextMessage(client, event.message.chat_id, `没有找到 ${alias}。发送 /sessions 看最近会话。`);
       return true;
     }
-    await sendTextMessage(client, event.message.chat_id, formatDiffDetails(session));
+    await sendTextMessage(client, event.message.chat_id, formatDiffDetails(chatKey, session));
     return true;
   }
 
@@ -674,7 +781,7 @@ async function handleCommand(client, event, text) {
       await sendTextMessage(client, event.message.chat_id, `没有找到 ${aliasOnly}。发送 /sessions 看最近会话。`);
       return true;
     }
-    await sendTextMessage(client, event.message.chat_id, formatSessionTranscript(session, 10));
+    await sendTextMessage(client, event.message.chat_id, formatSessionTranscript(chatKey, session, 10));
     return true;
   }
 
@@ -720,7 +827,10 @@ async function queueTurn(client, event, prompt, alias) {
         prompt,
         config: {
           ...config,
-          workspace
+          workspace,
+          onSpawn: (child) => {
+            activeProcesses.set(jobKey, child);
+          }
         }
       });
       const afterSnapshot = await captureWorkspaceSnapshot(workspace);
@@ -767,6 +877,22 @@ async function queueTurn(client, event, prompt, alias) {
     .catch(async (error) => {
       const currentSession = store.getSession(chatKey, alias);
       const providerLabel = getProviderLabel(currentSession?.provider || config.defaultAgentProvider);
+      if (stopRequests.has(jobKey)) {
+        stopRequests.delete(jobKey);
+        await store.updateSession(chatKey, alias, {
+          status: 'idle',
+          currentTaskPreview: '',
+          lastResultPreview: '已手动停止当前任务。',
+          lastFinishedAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        }).catch(() => {});
+        await store.appendTurn(chatKey, alias, {
+          role: 'assistant',
+          text: '当前任务已手动停止。',
+          createdAt: new Date().toISOString()
+        }).catch(() => {});
+        return;
+      }
       await logRuntime('agent-turn-failed', {
         chatKey,
         alias,
@@ -799,6 +925,8 @@ async function queueTurn(client, event, prompt, alias) {
       );
     })
     .finally(() => {
+      activeProcesses.delete(jobKey);
+      stopRequests.delete(jobKey);
       if (activeJobs.get(jobKey) === next) {
         activeJobs.delete(jobKey);
       }
