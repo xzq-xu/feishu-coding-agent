@@ -1062,7 +1062,7 @@ function formatMainPanelHint(chatKey, isGroup) {
       ];
 
   const header = isGroup
-    ? '群聊主面板只接受 `@机器人 + 命令`，不直接承接任务正文。'
+    ? '群聊主面板只接受 `@机器人 + 命令` 或 `@机器人 S1: ...`，不直接承接任务正文。'
     : '私聊主面板只接受命令，不直接承接任务正文。';
 
   return [
@@ -1077,7 +1077,9 @@ function formatMainPanelHint(chatKey, isGroup) {
     '最近会话：',
     (isGroup ? formatRecentSessions(chatKey) : formatGlobalRecentSessions()).replace(/^最近会话:\s*/, ''),
     '',
-    '真正的任务内容，请去对应 session 的话题里继续回复；如果你就在主面板，也可以用 `S1:` 这种显式路由继续。'
+    isGroup
+      ? '真正的任务内容，请去对应 session 的话题里继续回复；如果你还在群聊主面板，请使用 `@机器人 S1:` 这种显式路由。'
+      : '真正的任务内容，请去对应 session 的话题里继续回复；如果你就在主面板，也可以用 `S1:` 这种显式路由继续。'
   ].join('\n');
 }
 
@@ -1158,8 +1160,8 @@ function formatHelp() {
   return [
     'Codex 飞书机器人已就绪。',
     '',
-    '直接发送文本：发给当前活跃会话',
-    'S1: 继续优化这个方案：把消息显式发给指定会话',
+    '私聊里可直接发送 `S1:` 把消息显式发给指定会话',
+    '群聊主面板里请使用 `@机器人 S1:`；进入机器人自己的线程后可直接继续回复',
     '/agent：查看当前活跃会话使用的 Agent',
     '/new：创建一个新的会话，并设为当前活跃',
     '/new cursor：创建一个使用 Cursor Agent 的新会话',
@@ -1958,7 +1960,8 @@ async function processIncomingBatch(client, events) {
   const threadSession = resolveSessionFromThread(chatKey, primaryEvent);
   const prefixed = parseSessionPrefixedPrompt(normalizedText);
   const slashCommandForBot = normalizedText.startsWith('/') && (!isGroup || Boolean(threadSession) || mentioned);
-  const addressedToBot = mentioned || Boolean(prefixed) || slashCommandForBot;
+  const prefixedForBot = !isGroup || Boolean(threadSession) || mentioned;
+  const addressedToBot = mentioned || (Boolean(prefixed) && prefixedForBot) || slashCommandForBot;
 
   if (isGroup && !threadSession && !addressedToBot) {
     return;
@@ -2040,6 +2043,10 @@ async function processIncomingBatch(client, events) {
   let prompt;
 
   if (prefixed) {
+    if (isGroup && !threadSession && !mentioned) {
+      await sendTextMessage(client, message.chat_id, formatMainPanelHint(chatKey, true), getMessageId(primaryEvent) || null);
+      return;
+    }
     alias = prefixed.alias;
     prompt = cleanedText;
     const targetSession = store.getSession(chatKey, alias);
