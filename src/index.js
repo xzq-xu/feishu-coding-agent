@@ -1668,7 +1668,7 @@ async function processIncomingBatch(client, events) {
   const threadSession = resolveSessionFromThread(chatKey, primaryEvent);
 
   if (isGroup && !threadSession && !mentioned) {
-    if (threadMarkers.length) {
+    if (message.thread_id) {
       await sendTextMessage(
         client,
         message.chat_id,
