@@ -169,9 +169,54 @@ function formatRecentSessions(chatKey) {
         : session.lastResultPreview || session.lastAssistantMessage || session.lastUserMessage || session.title,
       60
     );
-    const workspace = session.workspace ? ` @ ${trimPreview(session.workspace, 36)}` : '';
-    lines.push(`${session.alias}${activeMark} ${getStatusBadge(effectiveStatus)} [${getProviderLabel(session.provider)}] ${preview}${workspace}`);
+    lines.push(`${session.alias}${activeMark} ${getStatusBadge(effectiveStatus)} [${getProviderLabel(session.provider)}] ${preview}`);
+    lines.push(`工作目录: ${session.workspace || config.defaultWorkspace}`);
   }
+  return lines.join('\n');
+}
+
+function getChatTypeLabel(chatKey) {
+  return chatKey.startsWith('oc_') ? '群聊' : '私聊';
+}
+
+function getChatDisplayName(chatKey) {
+  const meta = store.getChatMeta(chatKey);
+  if (meta.chatName) {
+    return meta.chatName;
+  }
+  return `${getChatTypeLabel(chatKey)} ${chatKey.slice(-6)}`;
+}
+
+function formatGlobalRecentSessions() {
+  const chats = store.listAllChats();
+  const allSessions = chats
+    .flatMap(({ chatKey, activeAlias, sessions }) => sessions.map((session) => ({
+      chatKey,
+      activeAlias,
+      session
+    })))
+    .sort((a, b) => new Date(b.session.updatedAt) - new Date(a.session.updatedAt))
+    .slice(0, RECENT_SESSION_LIMIT * 3);
+
+  if (!allSessions.length) {
+    return '最近会话: 暂无';
+  }
+
+  const lines = ['最近会话:'];
+  for (const { chatKey, activeAlias, session } of allSessions) {
+    const effectiveStatus = getEffectiveSessionStatus(chatKey, session);
+    const activeMark = activeAlias === session.alias ? ' *' : '';
+    const preview = trimPreview(
+      effectiveStatus === 'running'
+        ? session.currentTaskPreview || session.lastUserMessage || session.title
+        : session.lastResultPreview || session.lastAssistantMessage || session.lastUserMessage || session.title,
+      54
+    );
+    lines.push(`${session.alias}${activeMark} ${getStatusBadge(effectiveStatus)} [${getProviderLabel(session.provider)}] [${getChatDisplayName(chatKey)}] ${preview}`);
+    lines.push(`工作目录: ${session.workspace || config.defaultWorkspace}`);
+    lines.push(`转移 ID: ${session.id}`);
+  }
+
   return lines.join('\n');
 }
 
@@ -181,6 +226,7 @@ function getChatSourceLabel(event) {
 
 function buildResultCard({ chatKey, alias, output, sessionId, workspace, status = 'idle', provider = 'codex', branchChange = null, commitChange = null, title = 'Agent 结果', sourceLabel = '' }) {
   const record = store.get(chatKey);
+  const currentSession = store.getSession(chatKey, alias);
   const sessionCount = store.listSessions(chatKey).length;
   const elements = [
     {
@@ -197,6 +243,7 @@ function buildResultCard({ chatKey, alias, output, sessionId, workspace, status 
         `**Agent**: ${getProviderLabel(provider)}`,
         sourceLabel ? `**来源**: ${sourceLabel}` : null,
         `**状态**: ${getStatusLabel(status)}`,
+        currentSession?.id ? `**转移 ID**: \`${currentSession.id}\`` : null,
         branchChange ? `**分支变化**: ${branchChange.before} -> ${branchChange.after}` : null,
         commitChange ? `**提交变化**: ${commitChange.before.slice(0, 7)} -> ${commitChange.after.slice(0, 7)}` : null,
         `**会话 ID**: ${sessionId || '未知'}`,
@@ -248,6 +295,7 @@ function formatSessionTranscript(chatKey, session, limit = 10) {
   const lines = [
     `${session.alias} 最近 ${recentTurns.length} 条消息:`,
     `Agent: ${getProviderLabel(session.provider)}`,
+    `转移 ID: ${session.id}`,
     `状态: ${getStatusLabel(getEffectiveSessionStatus(chatKey, session))}`,
     `工作目录: ${session.workspace || config.defaultWorkspace}`
   ];
@@ -265,6 +313,7 @@ function formatWorkspaceStatus(chatKey, session) {
   return [
     `会话: ${session.alias}`,
     `Agent: ${getProviderLabel(session.provider)}`,
+    `转移 ID: ${session.id}`,
     `状态: ${getStatusLabel(getEffectiveSessionStatus(chatKey, session))}`,
     `工作目录: ${session.workspace || config.defaultWorkspace}`,
     session.lastChangedFiles?.length ? `最近改动文件数: ${session.lastChangedFiles.length}` : null
@@ -279,6 +328,7 @@ function formatDiffDetails(chatKey, session) {
   const lines = [
     `会话: ${session.alias}`,
     `Agent: ${getProviderLabel(session.provider)}`,
+    `转移 ID: ${session.id}`,
     `状态: ${getStatusLabel(getEffectiveSessionStatus(chatKey, session))}`,
     `工作目录: ${session.workspace || config.defaultWorkspace}`
   ];
@@ -972,10 +1022,10 @@ function formatMainPanelHint(chatKey, isGroup) {
     ...commands,
     '',
     '当前状态：',
-    formatStatus(chatKey),
+    formatStatus(chatKey, { global: !isGroup }),
     '',
     '最近会话：',
-    formatRecentSessions(chatKey).replace(/^最近会话:\s*/, ''),
+    (isGroup ? formatRecentSessions(chatKey) : formatGlobalRecentSessions()).replace(/^最近会话:\s*/, ''),
     '',
     '真正的任务内容，请去对应 session 的话题里继续回复；如果你就在主面板，也可以用 `S1:` 这种显式路由继续。'
   ].join('\n');
@@ -1017,6 +1067,43 @@ async function fetchRecentGroupContext(client, event, limit = 12) {
   }
 }
 
+async function ensureChatMeta(client, chatKey, chatTypeHint = null) {
+  const current = store.getChatMeta(chatKey);
+  if (current.chatName && current.chatType) {
+    return current;
+  }
+
+  let chatName = current.chatName || '';
+  let chatType = current.chatType || chatTypeHint || null;
+
+  try {
+    const response = await client.im.v1.chat.get({
+      path: {
+        chat_id: chatKey
+      }
+    });
+    const data = response?.data || {};
+    chatName = data.name || data.chat?.name || chatName;
+    chatType = data.chat_mode || data.chat_type || data.chat?.chat_type || chatType;
+  } catch {
+    // Ignore fetch failures and keep local fallback labels.
+  }
+
+  await store.setChatMeta(chatKey, {
+    chatName,
+    chatType
+  });
+
+  return store.getChatMeta(chatKey);
+}
+
+async function ensureAllChatMeta(client) {
+  const chats = store.listAllChats();
+  for (const chat of chats) {
+    await ensureChatMeta(client, chat.chatKey, chat.chatType || null);
+  }
+}
+
 function formatHelp() {
   return [
     'Codex 飞书机器人已就绪。',
@@ -1038,8 +1125,10 @@ function formatHelp() {
     '/show：在线程里查看当前会话最近 10 条消息',
     '/show S1：查看某个会话最近 10 条消息',
     '/diff S1：查看某个会话最近一轮代码改动摘要',
-    '/sessions：查看最近活跃的几个会话',
-    '/status：查看当前聊天状态',
+    '/sessions：查看最近会话（私聊主面板里会显示全局）',
+    '/status：查看当前状态（私聊主面板里会显示全局）',
+    '/attach <转移ID>：把另一个聊天里的 session 挂接到当前聊天继续',
+    '/clean：清空会话。私聊里清空全部，群聊里清空当前群聊',
     '/help：显示帮助'
   ].join('\n');
 }
@@ -1060,11 +1149,30 @@ function formatUnknownCommand(command) {
     '/diff S1',
     '/sessions',
     '/status',
+    '/attach <转移ID>',
+    '/clean',
     '/help'
   ].join('\n');
 }
 
-function formatStatus(chatKey) {
+function formatStatus(chatKey, options = {}) {
+  if (options.global) {
+    const chats = store.listAllChats();
+    const allSessions = chats.flatMap(({ chatKey: key, sessions }) => sessions.map((session) => ({ chatKey: key, session })));
+    const running = allSessions.filter(({ chatKey: key, session }) => getEffectiveSessionStatus(key, session) === 'running');
+    const idle = allSessions.filter(({ chatKey: key, session }) => getEffectiveSessionStatus(key, session) === 'idle');
+    const lines = [
+      '视图: 全局',
+      `聊天数量: ${chats.length}`,
+      `会话数量: ${allSessions.length}`,
+      `运行中会话: ${running.length ? running.map(({ session }) => session.alias).join(', ') : '无'}`,
+      `空闲会话: ${idle.length ? idle.map(({ session }) => session.alias).join(', ') : '无'}`,
+      '跨聊天续接请使用 `/attach <转移ID>`',
+      formatGlobalRecentSessions()
+    ];
+    return lines.join('\n');
+  }
+
   const record = store.get(chatKey);
   const running = hasRunningJob(chatKey);
   const idleSessions = store.listSessions(chatKey).filter((session) => session.status === 'idle');
@@ -1176,6 +1284,62 @@ async function resetSession(client, event) {
   await sendTextMessage(client, event.message.chat_id, '已清空当前聊天的所有会话。下一条消息会新开 S1。');
 }
 
+async function cleanSessions(client, event) {
+  const isGroup = isGroupChat(event);
+  if (isGroup) {
+    const chatKey = getChatKey(event);
+    await store.resetChat(chatKey);
+    await sendTextMessage(client, event.message.chat_id, '已清空当前群聊下的所有会话。下一条消息会新开 S1。');
+    return;
+  }
+
+  await store.resetAllChats();
+  await sendTextMessage(client, event.message.chat_id, '已清空全部聊天下的所有会话。下一条消息会重新开始。');
+}
+
+async function attachSession(client, event, transferId) {
+  const chatKey = getChatKey(event);
+  const sourceRef = store.findSessionRefById(transferId);
+  if (!sourceRef) {
+    await sendTextMessage(client, event.message.chat_id, `没有找到转移 ID 为 \`${transferId}\` 的会话。`);
+    return true;
+  }
+
+  const effectiveStatus = getEffectiveSessionStatus(sourceRef.chatKey, sourceRef.session);
+  if (effectiveStatus === 'running') {
+    await sendTextMessage(
+      client,
+      event.message.chat_id,
+      [
+        `转移 ID \`${transferId}\` 当前仍在运行中。`,
+        `来源会话: ${sourceRef.session.alias} @ ${sourceRef.chatKey}`,
+        '请等它空闲后再 attach，避免两个聊天同时续接同一个底层会话。'
+      ].join('\n')
+    );
+    return true;
+  }
+
+  const attachedResult = await store.attachSession(chatKey, transferId);
+  if (!attachedResult) {
+    await sendTextMessage(client, event.message.chat_id, `没有找到转移 ID 为 \`${transferId}\` 的会话。`);
+    return true;
+  }
+
+  const { attached, alreadyAttached } = attachedResult;
+  await sendTextMessage(
+    client,
+    event.message.chat_id,
+    [
+      alreadyAttached ? `转移 ID \`${transferId}\` 已经在当前聊天里挂接为 ${attached.alias}。` : `已把转移 ID \`${transferId}\` 挂接到当前聊天，新的会话编号是 ${attached.alias}。`,
+      `Agent: ${getProviderLabel(attached.provider)}`,
+      `工作目录: ${attached.workspace || config.defaultWorkspace}`,
+      `当前状态: ${getStatusLabel(getEffectiveSessionStatus(chatKey, attached))}`,
+      `之后你可以直接发送 \`${attached.alias}: 你的新指令\` 继续。`
+    ].join('\n')
+  );
+  return true;
+}
+
 async function stopSessionRun(chatKey, alias) {
   const session = store.getSession(chatKey, alias);
   const jobKey = getJobKey(chatKey, session?.id || alias);
@@ -1257,6 +1421,16 @@ async function handleCommand(client, event, text, options = {}) {
   if (command.toLowerCase() === '/reset') {
     await resetSession(client, event);
     return true;
+  }
+
+  if (command.toLowerCase() === '/clean') {
+    await cleanSessions(client, event);
+    return true;
+  }
+
+  const attachMatch = command.match(/^\/attach\s+([a-f0-9-]{16,})$/i);
+  if (attachMatch) {
+    return attachSession(client, event, attachMatch[1]);
   }
 
   if (command.toLowerCase() === '/agent') {
@@ -1441,12 +1615,22 @@ async function handleCommand(client, event, text, options = {}) {
   }
 
   if (command.toLowerCase() === '/status') {
-    await sendTextMessage(client, event.message.chat_id, formatStatus(chatKey));
+    if (!isGroupChat(event)) {
+      await ensureAllChatMeta(client);
+    } else {
+      await ensureChatMeta(client, chatKey, event?.message?.chat_type || null);
+    }
+    await sendTextMessage(client, event.message.chat_id, formatStatus(chatKey, { global: !isGroupChat(event) }));
     return true;
   }
 
   if (command.toLowerCase() === '/sessions') {
-    await sendTextMessage(client, event.message.chat_id, formatRecentSessions(chatKey));
+    if (!isGroupChat(event)) {
+      await ensureAllChatMeta(client);
+    } else {
+      await ensureChatMeta(client, chatKey, event?.message?.chat_type || null);
+    }
+    await sendTextMessage(client, event.message.chat_id, !isGroupChat(event) ? formatGlobalRecentSessions() : formatRecentSessions(chatKey));
     return true;
   }
 
@@ -1698,6 +1882,7 @@ async function processIncomingBatch(client, events) {
   }
 
   const chatKey = getChatKey(primaryEvent);
+  await ensureChatMeta(client, chatKey, message.chat_type || null);
   const rawText = aggregateBatchText(events, primaryEvent);
   console.log('[message]', {
     chatId: message.chat_id,
@@ -1712,15 +1897,19 @@ async function processIncomingBatch(client, events) {
   const mentioned = isBotMentioned(primaryEvent);
   const threadMarkers = getThreadMarkers(primaryEvent);
   const threadSession = resolveSessionFromThread(chatKey, primaryEvent);
+  const prefixed = parseSessionPrefixedPrompt(normalizedText);
+  const addressedToBot = mentioned || Boolean(prefixed) || normalizedText.startsWith('/');
 
-  if (isGroup && !threadSession && !mentioned) {
-    if (message.thread_id) {
+  if (isGroup && !threadSession && !addressedToBot) {
+    return;
+  }
+
+  if (isGroup && !threadSession && message.thread_id && addressedToBot) {
       await sendTextMessage(
         client,
         message.chat_id,
         '这个话题原来对应的会话已经不存在了。请发送 `/new ...` 新建会话，或者回到主面板用 `S1:` 这样的显式路由继续。'
       );
-    }
     return;
   }
 
@@ -1782,7 +1971,6 @@ async function processIncomingBatch(client, events) {
     activeAlias: store.get(chatKey).activeAlias || null,
     batchSize: events.length
   });
-  const prefixed = parseSessionPrefixedPrompt(normalizedText);
   const promptSeed = prefixed ? prefixed.prompt : normalizedText;
   const quotedText = buildReferencedMessagePrompt(referencedMessage, promptSeed);
   const cleanedText = attachmentMessages.length

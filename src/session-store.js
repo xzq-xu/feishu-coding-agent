@@ -50,6 +50,8 @@ function normalizeChatRecord(chatKey, record) {
   if (!record) {
     return {
       chatKey,
+      chatName: '',
+      chatType: null,
       activeAlias: null,
       nextSessionNumber: 1,
       processedMessageIds: [],
@@ -60,6 +62,8 @@ function normalizeChatRecord(chatKey, record) {
   if (record.sessionId || record.updatedAt) {
     return {
       chatKey,
+      chatName: '',
+      chatType: null,
       activeAlias: 'S1',
       nextSessionNumber: 2,
       processedMessageIds: [],
@@ -86,6 +90,8 @@ function normalizeChatRecord(chatKey, record) {
 
   return {
     chatKey,
+    chatName: typeof record.chatName === 'string' ? record.chatName : '',
+    chatType: typeof record.chatType === 'string' ? record.chatType : null,
     activeAlias: record.activeAlias && sessions[record.activeAlias] ? record.activeAlias : null,
     nextSessionNumber,
     processedMessageIds: Array.isArray(record.processedMessageIds)
@@ -143,6 +149,43 @@ export class SessionStore {
     return Object.values(record.sessions).sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
   }
 
+  listChatKeys() {
+    this.ensureReady();
+    return Array.from(this.sessions.keys());
+  }
+
+  listAllChats() {
+    this.ensureReady();
+    return Array.from(this.sessions.entries()).map(([chatKey, record]) => ({
+      chatKey,
+      chatName: record.chatName || '',
+      chatType: record.chatType || null,
+      activeAlias: record.activeAlias,
+      sessions: this.listSessions(chatKey)
+    }));
+  }
+
+  getChatMeta(chatKey) {
+    const record = this.get(chatKey);
+    return {
+      chatKey,
+      chatName: record.chatName || '',
+      chatType: record.chatType || null
+    };
+  }
+
+  async setChatMeta(chatKey, updates = {}) {
+    const record = this.get(chatKey);
+    if (typeof updates.chatName === 'string') {
+      record.chatName = updates.chatName;
+    }
+    if (typeof updates.chatType === 'string') {
+      record.chatType = updates.chatType;
+    }
+    await this.flush();
+    return record;
+  }
+
   getSession(chatKey, alias) {
     const record = this.get(chatKey);
     return record.sessions[alias] || null;
@@ -154,6 +197,24 @@ export class SessionStore {
     }
     const record = this.get(chatKey);
     return Object.values(record.sessions).find((session) => session.id === id) || null;
+  }
+
+  findSessionRefById(id) {
+    if (!id) {
+      return null;
+    }
+    for (const [chatKey, record] of this.sessions.entries()) {
+      for (const session of Object.values(record.sessions)) {
+        if (session.id === id) {
+          return {
+            chatKey,
+            activeAlias: record.activeAlias,
+            session
+          };
+        }
+      }
+    }
+    return null;
   }
 
   async claimProcessedMessage(chatKey, messageId) {
@@ -262,6 +323,53 @@ export class SessionStore {
     });
     await this.flush();
     return record.sessions[alias];
+  }
+
+  async attachSession(chatKey, sourceSessionId) {
+    const sourceRef = this.findSessionRefById(sourceSessionId);
+    if (!sourceRef) {
+      return null;
+    }
+
+    const existing = this.getSessionById(chatKey, sourceSessionId);
+    if (existing) {
+      await this.setActiveSession(chatKey, existing.alias);
+      return {
+        attached: existing,
+        sourceRef,
+        alreadyAttached: true
+      };
+    }
+
+    const attached = await this.createSession(chatKey);
+    await this.updateSession(chatKey, attached.alias, {
+      id: sourceRef.session.id,
+      sessionId: sourceRef.session.sessionId,
+      provider: sourceRef.session.provider,
+      workspace: sourceRef.session.workspace,
+      status: sourceRef.session.status === 'running' ? 'idle' : sourceRef.session.status,
+      currentTaskPreview: '',
+      lastResultPreview: sourceRef.session.lastResultPreview,
+      lastStartedAt: sourceRef.session.lastStartedAt,
+      lastFinishedAt: sourceRef.session.lastFinishedAt,
+      lastDiffSummary: sourceRef.session.lastDiffSummary,
+      lastDiffPatch: sourceRef.session.lastDiffPatch,
+      lastChangedFiles: sourceRef.session.lastChangedFiles,
+      lastBranchChange: sourceRef.session.lastBranchChange,
+      lastCommitChange: sourceRef.session.lastCommitChange,
+      lastUserMessage: sourceRef.session.lastUserMessage,
+      lastAssistantMessage: sourceRef.session.lastAssistantMessage,
+      turns: sourceRef.session.turns.slice(-20),
+      rootMessageId: null,
+      messageIds: [],
+      threadIds: []
+    });
+
+    return {
+      attached: this.getSession(chatKey, attached.alias),
+      sourceRef,
+      alreadyAttached: false
+    };
   }
 
   async ensureActiveSession(chatKey) {
@@ -413,6 +521,12 @@ export class SessionStore {
   async resetChat(chatKey) {
     this.ensureReady();
     this.sessions.set(chatKey, normalizeChatRecord(chatKey, null));
+    await this.flush();
+  }
+
+  async resetAllChats() {
+    this.ensureReady();
+    this.sessions = new Map();
     await this.flush();
   }
 
