@@ -101,6 +101,77 @@ function normalizeChatRecord(chatKey, record) {
   };
 }
 
+function rebuildRecordSessions(record, sessionsToKeep) {
+  const orderedEntries = sessionsToKeep.sort((a, b) => {
+    const aNum = Number.parseInt(a[0].slice(1), 10);
+    const bNum = Number.parseInt(b[0].slice(1), 10);
+    return aNum - bNum;
+  });
+
+  const aliasMap = {};
+  const rebuiltSessions = {};
+
+  for (const [index, [oldAlias, session]] of orderedEntries.entries()) {
+    const newAlias = `S${index + 1}`;
+    aliasMap[oldAlias] = newAlias;
+    rebuiltSessions[newAlias] = normalizeSession(newAlias, {
+      ...session,
+      title: newAlias
+    });
+  }
+
+  let nextActiveAlias = null;
+  if (record.activeAlias && aliasMap[record.activeAlias]) {
+    nextActiveAlias = aliasMap[record.activeAlias];
+  } else if (orderedEntries.length > 0) {
+    const fallback = orderedEntries
+      .slice()
+      .sort((a, b) => new Date(b[1].updatedAt) - new Date(a[1].updatedAt))[0][0];
+    nextActiveAlias = aliasMap[fallback];
+  }
+
+  record.sessions = rebuiltSessions;
+  record.activeAlias = nextActiveAlias;
+  record.nextSessionNumber = orderedEntries.length + 1;
+
+  return {
+    activeAlias: nextActiveAlias,
+    aliasMap
+  };
+}
+
+function compactRecords(recordsMap) {
+  const ownerBySessionId = new Map();
+
+  for (const [chatKey, record] of recordsMap.entries()) {
+    for (const [alias, session] of Object.entries(record.sessions || {})) {
+      if (!session?.id) {
+        continue;
+      }
+      const current = ownerBySessionId.get(session.id);
+      if (!current || new Date(session.updatedAt || 0) > new Date(current.session.updatedAt || 0)) {
+        ownerBySessionId.set(session.id, { chatKey, alias, session });
+      }
+    }
+  }
+
+  for (const [chatKey, record] of recordsMap.entries()) {
+    const filtered = Object.entries(record.sessions || {}).filter(([alias, session]) => {
+      if (!session?.id) {
+        return true;
+      }
+      const owner = ownerBySessionId.get(session.id);
+      return owner && owner.chatKey === chatKey && owner.alias === alias;
+    });
+
+    rebuildRecordSessions(record, filtered);
+
+    if (Object.keys(record.sessions).length === 0) {
+      recordsMap.delete(chatKey);
+    }
+  }
+}
+
 export class SessionStore {
   constructor(dataDir) {
     this.filePath = path.join(dataDir, 'sessions.json');
@@ -117,6 +188,8 @@ export class SessionStore {
       this.sessions = new Map(
         Object.entries(parsed).map(([chatKey, record]) => [chatKey, normalizeChatRecord(chatKey, record)])
       );
+      compactRecords(this.sessions);
+      await this.flush();
     } catch (error) {
       if (error.code !== 'ENOENT') {
         throw error;
@@ -365,6 +438,10 @@ export class SessionStore {
       threadIds: []
     });
 
+    this.removeSessionCopiesExcept(sourceSessionId, chatKey, attached.alias);
+    compactRecords(this.sessions);
+    await this.flush();
+
     return {
       attached: this.getSession(chatKey, attached.alias),
       sourceRef,
@@ -477,50 +554,43 @@ export class SessionStore {
       return null;
     }
 
-    const orderedEntries = Object.entries(record.sessions).sort((a, b) => {
-      const aNum = Number.parseInt(a[0].slice(1), 10);
-      const bNum = Number.parseInt(b[0].slice(1), 10);
-      return aNum - bNum;
-    });
-
-    const remaining = orderedEntries.filter(([oldAlias]) => oldAlias !== alias);
-    const aliasMap = {};
-    const rebuiltSessions = {};
-
-    for (const [index, [oldAlias, session]] of remaining.entries()) {
-      const newAlias = `S${index + 1}`;
-      aliasMap[oldAlias] = newAlias;
-      rebuiltSessions[newAlias] = normalizeSession(newAlias, {
-        ...session,
-        title: newAlias
-      });
+    const remaining = Object.entries(record.sessions).filter(([oldAlias]) => oldAlias !== alias);
+    const rebuilt = rebuildRecordSessions(record, remaining);
+    if (Object.keys(record.sessions).length === 0) {
+      this.sessions.delete(chatKey);
     }
-
-    let nextActiveAlias = null;
-    if (record.activeAlias && aliasMap[record.activeAlias]) {
-      nextActiveAlias = aliasMap[record.activeAlias];
-    } else if (remaining.length > 0) {
-      const fallback = remaining
-        .slice()
-        .sort((a, b) => new Date(b[1].updatedAt) - new Date(a[1].updatedAt))[0][0];
-      nextActiveAlias = aliasMap[fallback];
-    }
-
-    record.sessions = rebuiltSessions;
-    record.activeAlias = nextActiveAlias;
-    record.nextSessionNumber = remaining.length + 1;
     await this.flush();
 
     return {
       deletedAlias: alias,
-      activeAlias: nextActiveAlias,
-      aliasMap
+      activeAlias: rebuilt.activeAlias,
+      aliasMap: rebuilt.aliasMap
     };
+  }
+
+  removeSessionCopiesExcept(sessionId, keepChatKey, keepAlias) {
+    if (!sessionId) {
+      return;
+    }
+
+    for (const [chatKey, record] of this.sessions.entries()) {
+      const entries = Object.entries(record.sessions);
+      const filtered = entries.filter(([alias, session]) => (
+        session.id !== sessionId || (chatKey === keepChatKey && alias === keepAlias)
+      ));
+
+      if (filtered.length !== entries.length) {
+        rebuildRecordSessions(record, filtered);
+        if (Object.keys(record.sessions).length === 0) {
+          this.sessions.delete(chatKey);
+        }
+      }
+    }
   }
 
   async resetChat(chatKey) {
     this.ensureReady();
-    this.sessions.set(chatKey, normalizeChatRecord(chatKey, null));
+    this.sessions.delete(chatKey);
     await this.flush();
   }
 
@@ -538,6 +608,8 @@ export class SessionStore {
       this.sessions = new Map(
         Object.entries(parsed).map(([chatKey, record]) => [chatKey, normalizeChatRecord(chatKey, record)])
       );
+      compactRecords(this.sessions);
+      await this.flush();
     } catch (error) {
       if (error.code !== 'ENOENT') {
         throw error;
