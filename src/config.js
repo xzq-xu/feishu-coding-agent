@@ -33,7 +33,6 @@ function readNumber(name, fallback) {
 export const config = {
   feishuAppId: readRequired('FEISHU_APP_ID'),
   feishuAppSecret: readRequired('FEISHU_APP_SECRET'),
-  feishuBotOpenId: process.env.FEISHU_BOT_OPEN_ID || '',
   defaultAgentProvider: (process.env.AGENT_PROVIDER || 'codex').toLowerCase(),
   codexBin: process.env.CODEX_BIN || 'codex',
   defaultWorkspace: path.resolve(process.env.CODEX_WORKSPACE || process.cwd()),

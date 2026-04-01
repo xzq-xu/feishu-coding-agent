@@ -75,7 +75,6 @@
 ```bash
 FEISHU_APP_ID=cli_xxx
 FEISHU_APP_SECRET=xxx
-FEISHU_BOT_OPEN_ID=ou_xxx
 AGENT_PROVIDER=codex
 CODEX_WORKSPACE=/Users/xzq/Documents/Playground
 CODEX_BIN=/Applications/Codex.app/Contents/Resources/codex
@@ -91,7 +90,7 @@ CODEX_SKIP_GIT_REPO_CHECK=true
 
 说明：
 
-- `FEISHU_BOT_OPEN_ID` 用来忽略机器人自己发出的消息，避免回环
+- 机器人会在启动时自动通过飞书 OpenAPI 拉取自己的 bot 信息，用于精确识别群聊里的 `@机器人`
 - `AGENT_PROVIDER` 用来设置默认 Agent，可选 `codex`、`claude`、`cursor`、`opencode`
 - `CODEX_WORKSPACE` 是 Codex 真正工作的目录
 - `CODEX_WORKSPACE` 现在只作为默认目录，新会话会默认继承它；后续可以在飞书里按会话改掉

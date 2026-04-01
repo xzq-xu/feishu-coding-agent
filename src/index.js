@@ -18,7 +18,8 @@ const RECENT_SESSION_LIMIT = 5;
 const REFERENCED_MESSAGE_KEYS = ['quote_message_id', 'upper_message_id', 'reply_message_id', 'source_message_id'];
 const MESSAGE_BATCH_WINDOW_MS = 1500;
 const botIdentity = {
-  names: new Set()
+  names: new Set(),
+  openIds: new Set()
 };
 let cleanupPromise = Promise.resolve();
 let processLockHandle = null;
@@ -188,22 +189,30 @@ function getChatDisplayName(chatKey) {
 }
 
 function formatGlobalRecentSessions() {
-  const chats = store.listAllChats();
+  const chats = store.listAllChats().filter((chat) => chat.sessions.length > 0);
   const allSessions = chats
     .flatMap(({ chatKey, activeAlias, sessions }) => sessions.map((session) => ({
       chatKey,
       activeAlias,
       session
     })))
-    .sort((a, b) => new Date(b.session.updatedAt) - new Date(a.session.updatedAt))
-    .slice(0, RECENT_SESSION_LIMIT * 3);
+    .sort((a, b) => new Date(b.session.updatedAt) - new Date(a.session.updatedAt));
 
-  if (!allSessions.length) {
+  const seen = new Set();
+  const uniqueSessions = allSessions.filter(({ session }) => {
+    if (seen.has(session.id)) {
+      return false;
+    }
+    seen.add(session.id);
+    return true;
+  }).slice(0, RECENT_SESSION_LIMIT * 3);
+
+  if (!uniqueSessions.length) {
     return '最近会话: 暂无';
   }
 
   const lines = ['最近会话:'];
-  for (const { chatKey, activeAlias, session } of allSessions) {
+  for (const { chatKey, activeAlias, session } of uniqueSessions) {
     const effectiveStatus = getEffectiveSessionStatus(chatKey, session);
     const activeMark = activeAlias === session.alias ? ' *' : '';
     const preview = trimPreview(
@@ -523,7 +532,48 @@ function isBotMentioned(event) {
     return false;
   }
 
+  if (botIdentity.openIds.size > 0) {
+    return mentions.some((mention) => {
+      const openId = normalizeMentionName(
+        mention?.id?.open_id || mention?.open_id || ''
+      );
+      return openId && botIdentity.openIds.has(openId);
+    });
+  }
+
   return mentions.some((mention) => getMentionCandidates(mention).some((candidate) => botIdentity.names.has(candidate)));
+}
+
+async function fetchBotInfo() {
+  const tokenResponse = await fetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8'
+    },
+    body: JSON.stringify({
+      app_id: config.feishuAppId,
+      app_secret: config.feishuAppSecret
+    })
+  });
+
+  const tokenPayload = await tokenResponse.json().catch(() => ({}));
+  if (!tokenResponse.ok || tokenPayload?.code !== 0 || !tokenPayload?.tenant_access_token) {
+    throw new Error(`tenant_access_token 获取失败: ${tokenPayload?.msg || tokenResponse.status}`);
+  }
+
+  const botResponse = await fetch('https://open.feishu.cn/open-apis/bot/v3/info', {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${tokenPayload.tenant_access_token}`
+    }
+  });
+
+  const botPayload = await botResponse.json().catch(() => ({}));
+  if (!botResponse.ok || botPayload?.code !== 0 || !botPayload?.bot) {
+    throw new Error(`bot info 获取失败: ${botPayload?.msg || botResponse.status}`);
+  }
+
+  return botPayload.bot;
 }
 
 function getThreadMarkers(event) {
@@ -1157,14 +1207,23 @@ function formatUnknownCommand(command) {
 
 function formatStatus(chatKey, options = {}) {
   if (options.global) {
-    const chats = store.listAllChats();
-    const allSessions = chats.flatMap(({ chatKey: key, sessions }) => sessions.map((session) => ({ chatKey: key, session })));
-    const running = allSessions.filter(({ chatKey: key, session }) => getEffectiveSessionStatus(key, session) === 'running');
-    const idle = allSessions.filter(({ chatKey: key, session }) => getEffectiveSessionStatus(key, session) === 'idle');
+    const chats = store.listAllChats().filter((chat) => chat.sessions.length > 0);
+    const allSessions = chats.flatMap(({ chatKey: key, sessions }) => sessions.map((session) => ({ chatKey: key, session })))
+      .sort((a, b) => new Date(b.session.updatedAt) - new Date(a.session.updatedAt));
+    const seen = new Set();
+    const uniqueSessions = allSessions.filter(({ session }) => {
+      if (seen.has(session.id)) {
+        return false;
+      }
+      seen.add(session.id);
+      return true;
+    });
+    const running = uniqueSessions.filter(({ chatKey: key, session }) => getEffectiveSessionStatus(key, session) === 'running');
+    const idle = uniqueSessions.filter(({ chatKey: key, session }) => getEffectiveSessionStatus(key, session) === 'idle');
     const lines = [
       '视图: 全局',
       `聊天数量: ${chats.length}`,
-      `会话数量: ${allSessions.length}`,
+      `会话数量: ${uniqueSessions.length}`,
       `运行中会话: ${running.length ? running.map(({ session }) => session.alias).join(', ') : '无'}`,
       `空闲会话: ${idle.length ? idle.map(({ session }) => session.alias).join(', ') : '无'}`,
       '跨聊天续接请使用 `/attach <转移ID>`',
@@ -2119,6 +2178,24 @@ async function main() {
     });
   }
 
+  try {
+    const botInfo = await fetchBotInfo();
+    if (botInfo?.app_name) {
+      botIdentity.names.add(normalizeMentionName(botInfo.app_name));
+    }
+    if (botInfo?.open_id) {
+      botIdentity.openIds.add(normalizeMentionName(botInfo.open_id));
+    }
+    console.log('[bot-info]', {
+      appName: botInfo?.app_name || null,
+      openId: botInfo?.open_id || null
+    });
+  } catch (error) {
+    await logRuntime('bot-info-init-failed', {
+      error: error?.message || '未知错误'
+    });
+  }
+
   const dispatcher = new Lark.EventDispatcher({}).register({
     'im.message.receive_v1': (payload) => {
       void (async () => {
@@ -2144,7 +2221,7 @@ async function main() {
         }
 
         const senderOpenId = getSenderOpenId(event);
-        if (config.feishuBotOpenId && senderOpenId === config.feishuBotOpenId) {
+        if (senderOpenId && botIdentity.openIds.has(normalizeMentionName(senderOpenId))) {
           return;
         }
 
