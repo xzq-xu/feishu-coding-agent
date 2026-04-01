@@ -1898,7 +1898,8 @@ async function processIncomingBatch(client, events) {
   const threadMarkers = getThreadMarkers(primaryEvent);
   const threadSession = resolveSessionFromThread(chatKey, primaryEvent);
   const prefixed = parseSessionPrefixedPrompt(normalizedText);
-  const addressedToBot = mentioned || Boolean(prefixed) || normalizedText.startsWith('/');
+  const slashCommandForBot = normalizedText.startsWith('/') && (!isGroup || Boolean(threadSession) || mentioned);
+  const addressedToBot = mentioned || Boolean(prefixed) || slashCommandForBot;
 
   if (isGroup && !threadSession && !addressedToBot) {
     return;
@@ -1914,7 +1915,7 @@ async function processIncomingBatch(client, events) {
   }
 
   const requiresReferencedContext = normalizedText.toLowerCase().startsWith('/new');
-  if (normalizedText.startsWith('/') && !requiresReferencedContext) {
+  if (slashCommandForBot && !requiresReferencedContext) {
     if (await handleCommand(client, primaryEvent, normalizedText)) {
       return;
     }
@@ -2142,13 +2143,19 @@ async function main() {
           return;
         }
 
-        if (!['text', 'post', 'image', 'file'].includes(message.message_type)) {
-          await sendTextMessage(client, message.chat_id, '当前 MVP 目前只支持文本、富文本、图片和文件消息。');
+        const senderOpenId = getSenderOpenId(event);
+        if (config.feishuBotOpenId && senderOpenId === config.feishuBotOpenId) {
           return;
         }
 
-        const senderOpenId = getSenderOpenId(event);
-        if (config.feishuBotOpenId && senderOpenId === config.feishuBotOpenId) {
+        if (!['text', 'post', 'image', 'file'].includes(message.message_type)) {
+          const chatKey = getChatKey(event);
+          const isGroup = isGroupChat(event);
+          const mentioned = isBotMentioned(event);
+          const threadSession = resolveSessionFromThread(chatKey, event);
+          if (!isGroup || mentioned || threadSession) {
+            await sendTextMessage(client, message.chat_id, '当前 MVP 目前只支持文本、富文本、图片和文件消息。');
+          }
           return;
         }
 
