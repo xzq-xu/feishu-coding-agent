@@ -1773,10 +1773,6 @@ async function processIncomingBatch(client, events) {
     return;
   }
 
-  const quotedText = buildReferencedMessagePrompt(referencedMessage, normalizedText);
-  const cleanedText = attachmentMessages.length
-    ? buildAttachmentPrompt(attachmentMessages, quotedText)
-    : quotedText;
   console.log('[route]', {
     chatId: chatKey,
     isGroup,
@@ -1787,12 +1783,17 @@ async function processIncomingBatch(client, events) {
     batchSize: events.length
   });
   const prefixed = parseSessionPrefixedPrompt(normalizedText);
+  const promptSeed = prefixed ? prefixed.prompt : normalizedText;
+  const quotedText = buildReferencedMessagePrompt(referencedMessage, promptSeed);
+  const cleanedText = attachmentMessages.length
+    ? buildAttachmentPrompt(attachmentMessages, quotedText)
+    : quotedText;
   let alias;
   let prompt;
 
   if (prefixed) {
     alias = prefixed.alias;
-    prompt = prefixed.prompt;
+    prompt = cleanedText;
     const targetSession = store.getSession(chatKey, alias);
     if (!targetSession) {
       await sendTextMessage(client, message.chat_id, `没有找到 ${alias}。发送 /sessions 看最近会话，或 /new 新建一个。`);
