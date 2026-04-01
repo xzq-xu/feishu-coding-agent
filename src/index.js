@@ -71,6 +71,21 @@ function getStatusBadge(status) {
   }
 }
 
+function getStageLabel(stage) {
+  switch (stage) {
+    case 'preparing':
+      return '准备启动';
+    case 'agent_running':
+      return 'Agent 执行中';
+    case 'analyzing_changes':
+      return '分析改动';
+    case 'sending_result':
+      return '整理结果';
+    default:
+      return '';
+  }
+}
+
 function getProviderLabel(provider) {
   switch ((provider || '').toLowerCase()) {
     case 'claude':
@@ -113,6 +128,25 @@ function trimPreview(text, max = 80) {
     return '暂无摘要';
   }
   return normalized.length > max ? `${normalized.slice(0, max - 1)}…` : normalized;
+}
+
+function formatRunningStatus(session) {
+  const stage = getStageLabel(session?.currentStage);
+  return stage ? `运行中·${stage}` : '运行中';
+}
+
+function formatElapsedDuration(startedAt) {
+  if (!startedAt) {
+    return '';
+  }
+  const diffMs = Math.max(0, Date.now() - new Date(startedAt).getTime());
+  const totalSeconds = Math.floor(diffMs / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes <= 0) {
+    return `${seconds} 秒`;
+  }
+  return `${minutes} 分 ${seconds} 秒`;
 }
 
 function sanitizeFilename(name) {
@@ -166,11 +200,14 @@ function formatRecentSessions(chatKey) {
     const activeMark = record.activeAlias === session.alias ? ' *' : '';
     const preview = trimPreview(
       effectiveStatus === 'running'
-        ? session.currentTaskPreview || session.lastUserMessage || session.title
+        ? session.currentActivityPreview || session.currentTaskPreview || session.lastUserMessage || session.title
         : session.lastResultPreview || session.lastAssistantMessage || session.lastUserMessage || session.title,
       60
     );
-    lines.push(`${session.alias}${activeMark} ${getStatusBadge(effectiveStatus)} [${getProviderLabel(session.provider)}] ${preview}`);
+    const statusText = effectiveStatus === 'running'
+      ? `[${formatRunningStatus(session)}]`
+      : getStatusBadge(effectiveStatus);
+    lines.push(`${session.alias}${activeMark} ${statusText} [${getProviderLabel(session.provider)}] ${preview}`);
     lines.push(`工作目录: ${session.workspace || config.defaultWorkspace}`);
   }
   return lines.join('\n');
@@ -217,11 +254,14 @@ function formatGlobalRecentSessions() {
     const activeMark = activeAlias === session.alias ? ' *' : '';
     const preview = trimPreview(
       effectiveStatus === 'running'
-        ? session.currentTaskPreview || session.lastUserMessage || session.title
+        ? session.currentActivityPreview || session.currentTaskPreview || session.lastUserMessage || session.title
         : session.lastResultPreview || session.lastAssistantMessage || session.lastUserMessage || session.title,
       54
     );
-    lines.push(`${session.alias}${activeMark} ${getStatusBadge(effectiveStatus)} [${getProviderLabel(session.provider)}] [${getChatDisplayName(chatKey)}] ${preview}`);
+    const statusText = effectiveStatus === 'running'
+      ? `[${formatRunningStatus(session)}]`
+      : getStatusBadge(effectiveStatus);
+    lines.push(`${session.alias}${activeMark} ${statusText} [${getProviderLabel(session.provider)}] [${getChatDisplayName(chatKey)}] ${preview}`);
     lines.push(`工作目录: ${session.workspace || config.defaultWorkspace}`);
     lines.push(`转移 ID: ${session.id}`);
   }
@@ -1226,7 +1266,7 @@ function formatStatus(chatKey, options = {}) {
       '视图: 全局',
       `聊天数量: ${chats.length}`,
       `会话数量: ${uniqueSessions.length}`,
-      `运行中会话: ${running.length ? running.map(({ session }) => session.alias).join(', ') : '无'}`,
+      `运行中会话: ${running.length ? running.map(({ session }) => `${session.alias}(${getStageLabel(session.currentStage) || '处理中'})`).join(', ') : '无'}`,
       `空闲会话: ${idle.length ? idle.map(({ session }) => session.alias).join(', ') : '无'}`,
       '跨聊天续接请使用 `/attach <转移ID>`',
       formatGlobalRecentSessions()
@@ -1249,6 +1289,12 @@ function formatStatus(chatKey, options = {}) {
     record.activeAlias && store.getSession(chatKey, record.activeAlias)
       ? `当前目录: ${store.getSession(chatKey, record.activeAlias).workspace || config.defaultWorkspace}`
       : `默认目录: ${config.defaultWorkspace}`,
+    record.activeAlias && store.getSession(chatKey, record.activeAlias)?.status === 'running'
+      ? `当前阶段: ${getStageLabel(store.getSession(chatKey, record.activeAlias)?.currentStage) || '处理中'}`
+      : null,
+    record.activeAlias && store.getSession(chatKey, record.activeAlias)?.status === 'running' && store.getSession(chatKey, record.activeAlias)?.currentActivityPreview
+      ? `最近进展: ${store.getSession(chatKey, record.activeAlias)?.currentActivityPreview}`
+      : null,
     formatRecentSessions(chatKey)
   ].filter(Boolean).join('\n');
 }
@@ -1339,10 +1385,56 @@ async function registerOutboundMessageBySessionId(chatKey, sessionInternalId, re
   }
 }
 
+function getThreadReplyTarget(chatKey, event) {
+  const threadSession = resolveSessionFromThread(chatKey, event);
+  if (!threadSession) {
+    return null;
+  }
+  return getMessageId(event) || threadSession.rootMessageId || null;
+}
+
+async function sendCommandReply(client, event, text) {
+  const chatKey = getChatKey(event);
+  const replyTarget = getThreadReplyTarget(chatKey, event);
+  return sendTextMessage(client, event.message.chat_id, text, replyTarget);
+}
+
+async function sendStageUpdate(client, event, chatKey, sessionInternalId, stage, provider, replyTargetOverride = null) {
+  const session = store.getSessionById(chatKey, sessionInternalId);
+  if (!session) {
+    return;
+  }
+
+  const replyTarget = replyTargetOverride || getMessageId(event) || session.rootMessageId || null;
+  if (!replyTarget) {
+    return;
+  }
+
+  const text = `${session.alias}（${getProviderLabel(provider)}）当前阶段：${getStageLabel(stage) || '处理中'}。`;
+  const response = await sendTextMessage(client, event.message.chat_id, text, replyTarget);
+  await registerOutboundMessageBySessionId(chatKey, sessionInternalId, response);
+}
+
+async function sendProgressUpdate(client, event, chatKey, sessionInternalId, provider, text, replyTargetOverride = null) {
+  const session = store.getSessionById(chatKey, sessionInternalId);
+  if (!session) {
+    return;
+  }
+
+  const replyTarget = replyTargetOverride || getMessageId(event) || session.rootMessageId || null;
+  if (!replyTarget) {
+    return;
+  }
+
+  const message = `${session.alias}（${getProviderLabel(provider)}）${text}`;
+  const response = await sendTextMessage(client, event.message.chat_id, message, replyTarget);
+  await registerOutboundMessageBySessionId(chatKey, sessionInternalId, response);
+}
+
 async function resetSession(client, event) {
   const chatKey = getChatKey(event);
   await store.resetChat(chatKey);
-  await sendTextMessage(client, event.message.chat_id, '已清空当前聊天的所有会话。下一条消息会新开 S1。');
+  await sendCommandReply(client, event, '已清空当前聊天的所有会话。下一条消息会新开 S1。');
 }
 
 async function cleanSessions(client, event) {
@@ -1350,27 +1442,27 @@ async function cleanSessions(client, event) {
   if (isGroup) {
     const chatKey = getChatKey(event);
     await store.resetChat(chatKey);
-    await sendTextMessage(client, event.message.chat_id, '已清空当前群聊下的所有会话。下一条消息会新开 S1。');
+    await sendCommandReply(client, event, '已清空当前群聊下的所有会话。下一条消息会新开 S1。');
     return;
   }
 
   await store.resetAllChats();
-  await sendTextMessage(client, event.message.chat_id, '已清空全部聊天下的所有会话。下一条消息会重新开始。');
+  await sendCommandReply(client, event, '已清空全部聊天下的所有会话。下一条消息会重新开始。');
 }
 
 async function attachSession(client, event, transferId) {
   const chatKey = getChatKey(event);
   const sourceRef = store.findSessionRefById(transferId);
   if (!sourceRef) {
-    await sendTextMessage(client, event.message.chat_id, `没有找到转移 ID 为 \`${transferId}\` 的会话。`);
+    await sendCommandReply(client, event, `没有找到转移 ID 为 \`${transferId}\` 的会话。`);
     return true;
   }
 
   const effectiveStatus = getEffectiveSessionStatus(sourceRef.chatKey, sourceRef.session);
   if (effectiveStatus === 'running') {
-    await sendTextMessage(
+    await sendCommandReply(
       client,
-      event.message.chat_id,
+      event,
       [
         `转移 ID \`${transferId}\` 当前仍在运行中。`,
         `来源会话: ${sourceRef.session.alias} @ ${sourceRef.chatKey}`,
@@ -1382,14 +1474,14 @@ async function attachSession(client, event, transferId) {
 
   const attachedResult = await store.attachSession(chatKey, transferId);
   if (!attachedResult) {
-    await sendTextMessage(client, event.message.chat_id, `没有找到转移 ID 为 \`${transferId}\` 的会话。`);
+    await sendCommandReply(client, event, `没有找到转移 ID 为 \`${transferId}\` 的会话。`);
     return true;
   }
 
   const { attached, alreadyAttached } = attachedResult;
-  await sendTextMessage(
+  await sendCommandReply(
     client,
-    event.message.chat_id,
+    event,
     [
       alreadyAttached ? `转移 ID \`${transferId}\` 已经在当前聊天里挂接为 ${attached.alias}。` : `已把转移 ID \`${transferId}\` 挂接到当前聊天，新的会话编号是 ${attached.alias}。`,
       `Agent: ${getProviderLabel(attached.provider)}`,
@@ -1475,7 +1567,7 @@ async function handleCommand(client, event, text, options = {}) {
   const chatKey = getChatKey(event);
 
   if (command.toLowerCase() === '/help') {
-    await sendTextMessage(client, event.message.chat_id, formatHelp());
+    await sendCommandReply(client, event, formatHelp());
     return true;
   }
 
@@ -1497,9 +1589,9 @@ async function handleCommand(client, event, text, options = {}) {
   if (command.toLowerCase() === '/agent') {
     const threadSession = resolveSessionFromThread(chatKey, event);
     const session = threadSession || await store.ensureActiveSession(chatKey);
-    await sendTextMessage(
+    await sendCommandReply(
       client,
-      event.message.chat_id,
+      event,
       [`会话: ${session.alias}`, `当前 Agent: ${getProviderLabel(session.provider || config.defaultAgentProvider)}`].join('\n')
     );
     return true;
@@ -1507,9 +1599,9 @@ async function handleCommand(client, event, text, options = {}) {
 
   const agentMatch = command.match(/^\/agent(?:\s+(S\d+))?\s+(codex|claude|cursor|opencode)$/i);
   if (agentMatch) {
-    await sendTextMessage(
+    await sendCommandReply(
       client,
-      event.message.chat_id,
+      event,
       [
         '已创建的会话不支持切换 Agent。',
         '这是为了避免底层会话上下文丢失或串线。',
@@ -1550,14 +1642,14 @@ async function handleCommand(client, event, text, options = {}) {
   if (command.toLowerCase() === '/cwd') {
     const threadSession = resolveSessionFromThread(chatKey, event);
     const session = threadSession || await store.ensureActiveSession(chatKey);
-    await sendTextMessage(client, event.message.chat_id, formatWorkspaceStatus(chatKey, session));
-    return true;
+      await sendCommandReply(client, event, formatWorkspaceStatus(chatKey, session));
+      return true;
   }
 
   if (command.toLowerCase() === '/stop') {
     const activeAlias = store.get(chatKey).activeAlias;
     if (!activeAlias) {
-      await sendTextMessage(client, event.message.chat_id, '当前没有可停止的会话。');
+      await sendCommandReply(client, event, '当前没有可停止的会话。');
       return true;
     }
     const stopped = await stopSessionRun(chatKey, activeAlias);
@@ -1571,13 +1663,13 @@ async function handleCommand(client, event, text, options = {}) {
           lastFinishedAt: new Date().toISOString(),
           updatedAt: new Date().toISOString()
         });
-        await sendTextMessage(client, event.message.chat_id, `${activeAlias} 没有检测到真实运行进程，已清理陈旧的运行中状态。`);
+        await sendCommandReply(client, event, `${activeAlias} 没有检测到真实运行进程，已清理陈旧的运行中状态。`);
         return true;
       }
-      await sendTextMessage(client, event.message.chat_id, `${activeAlias} 当前没有运行中的任务。`);
+      await sendCommandReply(client, event, `${activeAlias} 当前没有运行中的任务。`);
       return true;
     }
-    await sendTextMessage(client, event.message.chat_id, `已请求停止 ${activeAlias}，稍后会释放这个会话。`);
+    await sendCommandReply(client, event, `已请求停止 ${activeAlias}，稍后会释放这个会话。`);
     return true;
   }
 
@@ -1586,7 +1678,7 @@ async function handleCommand(client, event, text, options = {}) {
     const alias = stopMatch[1].toUpperCase();
     const session = store.getSession(chatKey, alias);
     if (!session) {
-      await sendTextMessage(client, event.message.chat_id, `没有找到 ${alias}。发送 /sessions 看最近会话。`);
+      await sendCommandReply(client, event, `没有找到 ${alias}。发送 /sessions 看最近会话。`);
       return true;
     }
     const stopped = await stopSessionRun(chatKey, alias);
@@ -1599,26 +1691,26 @@ async function handleCommand(client, event, text, options = {}) {
           lastFinishedAt: new Date().toISOString(),
           updatedAt: new Date().toISOString()
         });
-        await sendTextMessage(client, event.message.chat_id, `${alias} 没有检测到真实运行进程，已清理陈旧的运行中状态。`);
+        await sendCommandReply(client, event, `${alias} 没有检测到真实运行进程，已清理陈旧的运行中状态。`);
         return true;
       }
-      await sendTextMessage(client, event.message.chat_id, `${alias} 当前没有运行中的任务。`);
+      await sendCommandReply(client, event, `${alias} 当前没有运行中的任务。`);
       return true;
     }
-    await sendTextMessage(client, event.message.chat_id, `已请求停止 ${alias}，稍后会释放这个会话。`);
+    await sendCommandReply(client, event, `已请求停止 ${alias}，稍后会释放这个会话。`);
     return true;
   }
 
   if (command.toLowerCase() === '/delete') {
     const active = store.get(chatKey).activeAlias;
     if (!active) {
-      await sendTextMessage(client, event.message.chat_id, '当前没有可删除的会话。');
+      await sendCommandReply(client, event, '当前没有可删除的会话。');
       return true;
     }
     const deleted = await store.deleteSession(chatKey, active);
-    await sendTextMessage(
+    await sendCommandReply(
       client,
-      event.message.chat_id,
+      event,
       [
         `已删除 ${deleted.deletedAlias}。`,
         deleted.activeAlias ? `当前活跃会话已切换为 ${deleted.activeAlias}。` : '当前聊天已没有剩余会话。',
@@ -1635,12 +1727,12 @@ async function handleCommand(client, event, text, options = {}) {
     const alias = deleteMatch[1].toUpperCase();
     const deleted = await store.deleteSession(chatKey, alias);
     if (!deleted) {
-      await sendTextMessage(client, event.message.chat_id, `没有找到 ${alias}。发送 /sessions 看最近会话。`);
+      await sendCommandReply(client, event, `没有找到 ${alias}。发送 /sessions 看最近会话。`);
       return true;
     }
-    await sendTextMessage(
+    await sendCommandReply(
       client,
-      event.message.chat_id,
+      event,
       [
         `已删除 ${deleted.deletedAlias}。`,
         deleted.activeAlias ? `当前活跃会话: ${deleted.activeAlias}` : '当前聊天已没有剩余会话。',
@@ -1657,20 +1749,20 @@ async function handleCommand(client, event, text, options = {}) {
     const alias = cwdMatch[1]?.toUpperCase() || (await store.ensureActiveSession(chatKey)).alias;
     const session = store.getSession(chatKey, alias);
     if (!session) {
-      await sendTextMessage(client, event.message.chat_id, `没有找到 ${alias}。发送 /sessions 看最近会话。`);
+      await sendCommandReply(client, event, `没有找到 ${alias}。发送 /sessions 看最近会话。`);
       return true;
     }
 
     try {
       const workspace = await resolveWorkspaceInput(cwdMatch[2]);
       await store.updateSession(chatKey, alias, { workspace });
-      await sendTextMessage(
+      await sendCommandReply(
         client,
-        event.message.chat_id,
+        event,
         [`已更新 ${alias} 的工作目录。`, `工作目录: ${workspace}`, `之后发给 ${alias} 的消息都会在这个目录里运行。`].join('\n')
       );
     } catch (error) {
-      await sendTextMessage(client, event.message.chat_id, error.message || '工作目录设置失败。');
+      await sendCommandReply(client, event, error.message || '工作目录设置失败。');
     }
     return true;
   }
@@ -1681,7 +1773,7 @@ async function handleCommand(client, event, text, options = {}) {
     } else {
       await ensureChatMeta(client, chatKey, event?.message?.chat_type || null);
     }
-    await sendTextMessage(client, event.message.chat_id, formatStatus(chatKey, { global: !isGroupChat(event) }));
+    await sendCommandReply(client, event, formatStatus(chatKey, { global: !isGroupChat(event) }));
     return true;
   }
 
@@ -1691,7 +1783,7 @@ async function handleCommand(client, event, text, options = {}) {
     } else {
       await ensureChatMeta(client, chatKey, event?.message?.chat_type || null);
     }
-    await sendTextMessage(client, event.message.chat_id, !isGroupChat(event) ? formatGlobalRecentSessions() : formatRecentSessions(chatKey));
+    await sendCommandReply(client, event, !isGroupChat(event) ? formatGlobalRecentSessions() : formatRecentSessions(chatKey));
     return true;
   }
 
@@ -1699,15 +1791,15 @@ async function handleCommand(client, event, text, options = {}) {
   if (showMatch) {
     const alias = showMatch[1]?.toUpperCase() || resolveSessionFromThread(chatKey, event)?.alias || store.get(chatKey).activeAlias;
     if (!alias) {
-      await sendTextMessage(client, event.message.chat_id, '当前没有可查看消息记录的会话。');
+      await sendCommandReply(client, event, '当前没有可查看消息记录的会话。');
       return true;
     }
     const session = store.getSession(chatKey, alias);
     if (!session) {
-      await sendTextMessage(client, event.message.chat_id, `没有找到 ${alias}。发送 /sessions 看最近会话。`);
+      await sendCommandReply(client, event, `没有找到 ${alias}。发送 /sessions 看最近会话。`);
       return true;
     }
-    await sendTextMessage(client, event.message.chat_id, formatSessionTranscript(chatKey, session, 10));
+    await sendCommandReply(client, event, formatSessionTranscript(chatKey, session, 10));
     return true;
   }
 
@@ -1715,15 +1807,15 @@ async function handleCommand(client, event, text, options = {}) {
   if (diffMatch) {
     const alias = diffMatch[1]?.toUpperCase() || resolveSessionFromThread(chatKey, event)?.alias || store.get(chatKey).activeAlias;
     if (!alias) {
-      await sendTextMessage(client, event.message.chat_id, '当前没有可查看 diff 的会话。');
+      await sendCommandReply(client, event, '当前没有可查看 diff 的会话。');
       return true;
     }
     const session = store.getSession(chatKey, alias);
     if (!session) {
-      await sendTextMessage(client, event.message.chat_id, `没有找到 ${alias}。发送 /sessions 看最近会话。`);
+      await sendCommandReply(client, event, `没有找到 ${alias}。发送 /sessions 看最近会话。`);
       return true;
     }
-    await sendTextMessage(client, event.message.chat_id, formatDiffDetails(chatKey, session));
+    await sendCommandReply(client, event, formatDiffDetails(chatKey, session));
     return true;
   }
 
@@ -1731,15 +1823,15 @@ async function handleCommand(client, event, text, options = {}) {
   if (aliasOnly) {
     const session = store.getSession(chatKey, aliasOnly);
     if (!session) {
-      await sendTextMessage(client, event.message.chat_id, `没有找到 ${aliasOnly}。发送 /sessions 看最近会话。`);
+      await sendCommandReply(client, event, `没有找到 ${aliasOnly}。发送 /sessions 看最近会话。`);
       return true;
     }
-    await sendTextMessage(client, event.message.chat_id, formatSessionTranscript(chatKey, session, 10));
+    await sendCommandReply(client, event, formatSessionTranscript(chatKey, session, 10));
     return true;
   }
 
   if (command.startsWith('/')) {
-    await sendTextMessage(client, event.message.chat_id, formatUnknownCommand(command));
+    await sendCommandReply(client, event, formatUnknownCommand(command));
     return true;
   }
 
@@ -1776,6 +1868,10 @@ async function queueTurn(client, event, prompt, alias) {
       const incomingMessageId = getMessageId(event);
       const liveAlias = session.alias;
       const replyTargetMessageId = incomingMessageId || rootMessageId || null;
+      let latestActivityPreview = '';
+      let lastActivityAt = Date.now();
+      let lastReportedActivity = '';
+      let lastHeartbeatAt = 0;
       const opening = session?.sessionId
         ? `已收到，继续 ${liveAlias}（${getProviderLabel(provider)}）处理中。`
         : `已收到，正在为你启动新的会话 ${liveAlias}（${getProviderLabel(provider)}）。`;
@@ -1799,74 +1895,156 @@ async function queueTurn(client, event, prompt, alias) {
       await store.updateSessionById(chatKey, sessionInternalId, {
         status: 'running',
         currentTaskPreview: trimPreview(prompt, 120),
+        currentStage: 'preparing',
+        currentStageAt: new Date().toISOString(),
+        currentActivityPreview: '',
+        currentActivityAt: null,
         lastStartedAt: new Date().toISOString()
       });
+      await sendStageUpdate(client, event, chatKey, sessionInternalId, 'preparing', provider, replyTargetMessageId);
+      const heartbeatTimer = setInterval(() => {
+        void (async () => {
+          const liveSession = store.getSessionById(chatKey, sessionInternalId);
+          if (!liveSession || liveSession.status !== 'running') {
+            return;
+          }
+
+          const now = Date.now();
+          if (now - lastHeartbeatAt < 30000) {
+            return;
+          }
+
+          if (latestActivityPreview && latestActivityPreview !== lastReportedActivity) {
+            lastReportedActivity = latestActivityPreview;
+            lastHeartbeatAt = now;
+            await sendProgressUpdate(
+              client,
+              event,
+              chatKey,
+              sessionInternalId,
+              provider,
+              `最近进展：${latestActivityPreview}`,
+              replyTargetMessageId
+            );
+            return;
+          }
+
+          if (now - lastActivityAt >= 30000) {
+            lastHeartbeatAt = now;
+            await sendProgressUpdate(
+              client,
+              event,
+              chatKey,
+              sessionInternalId,
+              provider,
+              `仍在 ${getStageLabel(liveSession.currentStage) || '执行中'}，已持续 ${formatElapsedDuration(liveSession.lastStartedAt)}。`,
+              replyTargetMessageId
+            );
+          }
+        })().catch(() => {});
+      }, 15000);
+      heartbeatTimer.unref?.();
       const beforeSnapshot = await captureWorkspaceSnapshot(workspace);
 
-      const result = await runAgentTurn({
-        provider,
-        sessionId: session?.sessionId || null,
-        prompt,
-        config: {
-          ...config,
-          workspace,
-          onSpawn: (child) => {
-            activeProcesses.set(jobKey, child);
-          }
-        }
-      });
-      const afterSnapshot = await captureWorkspaceSnapshot(workspace);
-      const diff = await summarizeWorkspaceChanges(beforeSnapshot, afterSnapshot);
-
-      const updatedSession = await store.updateSessionById(chatKey, sessionInternalId, {
-        sessionId: result.sessionId,
-        provider,
-        status: 'idle',
-        currentTaskPreview: '',
-        lastResultPreview: trimPreview(result.output || 'Codex 没有返回正文。', 120),
-        lastDiffSummary: diff.summary,
-        lastDiffPatch: diff.patch,
-        lastChangedFiles: diff.changedFiles,
-        lastBranchChange: diff.branchChange,
-        lastCommitChange: diff.commitChange,
-        lastFinishedAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString()
-      });
-      if (!updatedSession) {
-        await logRuntime('agent-turn-session-missing-after-run', {
-          chatKey,
-          alias: liveAlias,
-          sessionInternalId,
+      try {
+        const result = await runAgentTurn({
           provider,
-          workspace
+          sessionId: session?.sessionId || null,
+          prompt,
+          config: {
+            ...config,
+            workspace,
+            onSpawn: (child) => {
+              activeProcesses.set(jobKey, child);
+              void store.updateSessionById(chatKey, sessionInternalId, {
+                currentStage: 'agent_running',
+                currentStageAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString()
+              }).catch(() => {});
+              void sendStageUpdate(client, event, chatKey, sessionInternalId, 'agent_running', provider, replyTargetMessageId).catch(() => {});
+            },
+            onActivity: (snippet) => {
+              latestActivityPreview = trimPreview(snippet, 120);
+              lastActivityAt = Date.now();
+              void store.updateSessionById(chatKey, sessionInternalId, {
+                currentActivityPreview: latestActivityPreview,
+                currentActivityAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString()
+              }).catch(() => {});
+            }
+          }
         });
-        return;
-      }
-      await store.appendTurnById(chatKey, sessionInternalId, {
-        role: 'assistant',
-        text: result.output || 'Codex 没有返回正文。',
-        createdAt: new Date().toISOString()
-      });
+        await store.updateSessionById(chatKey, sessionInternalId, {
+          currentStage: 'analyzing_changes',
+          currentStageAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        });
+        await sendStageUpdate(client, event, chatKey, sessionInternalId, 'analyzing_changes', provider, replyTargetMessageId);
+        const afterSnapshot = await captureWorkspaceSnapshot(workspace);
+        const diff = await summarizeWorkspaceChanges(beforeSnapshot, afterSnapshot);
 
-      const cardReply = await sendResultCard(client, event.message.chat_id, {
-        chatKey,
-        alias: updatedSession.alias,
-        output: [
-          `状态: ${getStatusLabel('success')}`,
-          result.output || 'Codex 没有返回正文。',
-          '',
-          diff.summary
-        ].join('\n\n'),
-        sessionId: result.sessionId || '未知',
-        workspace,
-        status: 'success',
-        provider,
-        sourceLabel: getChatSourceLabel(event),
-        branchChange: diff.branchChange,
-        commitChange: diff.commitChange,
-        title: `${getProviderLabel(provider)} 结果`
-      }, replyTargetMessageId || session?.rootMessageId || null);
-      await registerOutboundMessageBySessionId(chatKey, sessionInternalId, cardReply);
+        await store.updateSessionById(chatKey, sessionInternalId, {
+          currentStage: 'sending_result',
+          currentStageAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        });
+        await sendStageUpdate(client, event, chatKey, sessionInternalId, 'sending_result', provider, replyTargetMessageId);
+        const updatedSession = await store.updateSessionById(chatKey, sessionInternalId, {
+          sessionId: result.sessionId,
+          provider,
+          status: 'idle',
+          currentTaskPreview: '',
+          currentStage: '',
+          currentStageAt: null,
+          currentActivityPreview: '',
+          currentActivityAt: null,
+          lastResultPreview: trimPreview(result.output || 'Codex 没有返回正文。', 120),
+          lastDiffSummary: diff.summary,
+          lastDiffPatch: diff.patch,
+          lastChangedFiles: diff.changedFiles,
+          lastBranchChange: diff.branchChange,
+          lastCommitChange: diff.commitChange,
+          lastFinishedAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        });
+        if (!updatedSession) {
+          await logRuntime('agent-turn-session-missing-after-run', {
+            chatKey,
+            alias: liveAlias,
+            sessionInternalId,
+            provider,
+            workspace
+          });
+          return;
+        }
+        await store.appendTurnById(chatKey, sessionInternalId, {
+          role: 'assistant',
+          text: result.output || 'Codex 没有返回正文。',
+          createdAt: new Date().toISOString()
+        });
+
+        const cardReply = await sendResultCard(client, event.message.chat_id, {
+          chatKey,
+          alias: updatedSession.alias,
+          output: [
+            `状态: ${getStatusLabel('success')}`,
+            result.output || 'Codex 没有返回正文。',
+            '',
+            diff.summary
+          ].join('\n\n'),
+          sessionId: result.sessionId || '未知',
+          workspace,
+          status: 'success',
+          provider,
+          sourceLabel: getChatSourceLabel(event),
+          branchChange: diff.branchChange,
+          commitChange: diff.commitChange,
+          title: `${getProviderLabel(provider)} 结果`
+        }, replyTargetMessageId || session?.rootMessageId || null);
+        await registerOutboundMessageBySessionId(chatKey, sessionInternalId, cardReply);
+      } finally {
+        clearInterval(heartbeatTimer);
+      }
     })
     .catch(async (error) => {
       const currentSession = store.getSessionById(chatKey, sessionInternalId);
@@ -1876,6 +2054,10 @@ async function queueTurn(client, event, prompt, alias) {
         await store.updateSessionById(chatKey, sessionInternalId, {
           status: 'idle',
           currentTaskPreview: '',
+          currentStage: '',
+          currentStageAt: null,
+          currentActivityPreview: '',
+          currentActivityAt: null,
           lastResultPreview: '已手动停止当前任务。',
           lastFinishedAt: new Date().toISOString(),
           updatedAt: new Date().toISOString()
@@ -1903,6 +2085,10 @@ async function queueTurn(client, event, prompt, alias) {
       await store.updateSessionById(chatKey, sessionInternalId, {
         status: 'error',
         currentTaskPreview: '',
+        currentStage: '',
+        currentStageAt: null,
+        currentActivityPreview: '',
+        currentActivityAt: null,
         lastResultPreview: trimPreview(error.stderr || error.message || '未知错误', 120),
         lastDiffSummary: '',
         lastDiffPatch: '',

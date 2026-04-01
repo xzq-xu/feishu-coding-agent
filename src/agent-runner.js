@@ -35,6 +35,44 @@ function parseJsonOutput(stdout) {
   }
 }
 
+function summarizeActivity(text) {
+  const normalized = safeTrim(text).replace(/\s+/g, ' ');
+  if (!normalized) {
+    return '';
+  }
+  return normalized.length > 140 ? `${normalized.slice(0, 139)}…` : normalized;
+}
+
+function emitActivity(config, text) {
+  const summary = summarizeActivity(text);
+  if (!summary) {
+    return;
+  }
+  config.onActivity?.(summary);
+}
+
+function summarizeCodexEvent(event) {
+  if (!event || typeof event !== 'object') {
+    return '';
+  }
+  if (typeof event.message === 'string' && event.message.trim()) {
+    return event.message;
+  }
+  if (event.type === 'thread.started' && event.thread_id) {
+    return `已连接会话 ${event.thread_id}`;
+  }
+  if (event.item?.type === 'agent_message' && typeof event.item.text === 'string') {
+    return event.item.text;
+  }
+  if (event.item?.type && typeof event.item.type === 'string') {
+    return `正在处理 ${event.item.type}`;
+  }
+  if (typeof event.type === 'string' && event.type) {
+    return `事件: ${event.type}`;
+  }
+  return '';
+}
+
 async function collectExit(child) {
   return new Promise((resolve, reject) => {
     child.on('error', reject);
@@ -124,6 +162,7 @@ async function runCodexTurn({ sessionId, prompt, config, workspace }) {
       return;
     }
     events.push(event);
+    emitActivity(config, summarizeCodexEvent(event));
     if (event.type === 'thread.started' && event.thread_id) {
       threadId = event.thread_id;
     }
@@ -133,6 +172,7 @@ async function runCodexTurn({ sessionId, prompt, config, workspace }) {
   });
   child.stderr.on('data', (chunk) => {
     stderr += chunk.toString('utf8');
+    emitActivity(config, chunk.toString('utf8'));
   });
 
   const exitCode = await collectExit(child);
@@ -169,9 +209,11 @@ async function runPrintAgent({ provider, bin, args, workspace, sessionId }) {
   let stderr = '';
   child.stdout.on('data', (chunk) => {
     stdout += chunk.toString('utf8');
+    emitActivity(config, chunk.toString('utf8'));
   });
   child.stderr.on('data', (chunk) => {
     stderr += chunk.toString('utf8');
+    emitActivity(config, chunk.toString('utf8'));
   });
 
   const exitCode = await collectExit(child);
@@ -207,9 +249,11 @@ async function runTextAgent({ provider, bin, args, workspace, sessionId }) {
   let stderr = '';
   child.stdout.on('data', (chunk) => {
     stdout += chunk.toString('utf8');
+    emitActivity(config, chunk.toString('utf8'));
   });
   child.stderr.on('data', (chunk) => {
     stderr += chunk.toString('utf8');
+    emitActivity(config, chunk.toString('utf8'));
   });
 
   const exitCode = await collectExit(child);
@@ -326,6 +370,7 @@ async function runOpenCodeTurn({ sessionId, prompt, config, workspace }) {
       return;
     }
     events.push(event);
+    emitActivity(config, event.part?.text || line);
     if (event.sessionID) {
       nextSessionId = event.sessionID;
     }
@@ -338,6 +383,7 @@ async function runOpenCodeTurn({ sessionId, prompt, config, workspace }) {
 
   child.stderr.on('data', (chunk) => {
     stderr += chunk.toString('utf8');
+    emitActivity(config, chunk.toString('utf8'));
   });
 
   const exitCode = await collectExit(child);
