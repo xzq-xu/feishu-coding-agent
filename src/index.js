@@ -25,8 +25,8 @@ let processLockHandle = null;
 let shutdownStarted = false;
 const pendingMessageBatches = new Map();
 
-function getJobKey(chatKey, alias) {
-  return `${chatKey}::${alias}`;
+function getJobKey(chatKey, sessionKey) {
+  return `${chatKey}::${sessionKey}`;
 }
 
 async function logRuntime(message, details = null) {
@@ -90,7 +90,9 @@ function hasRunningJob(chatKey) {
 }
 
 function isSessionActivelyRunning(chatKey, alias) {
-  const jobKey = getJobKey(chatKey, alias);
+  const session = store.getSession(chatKey, alias);
+  const sessionKey = session?.id || alias;
+  const jobKey = getJobKey(chatKey, sessionKey);
   return activeJobs.has(jobKey) || activeProcesses.has(jobKey);
 }
 
@@ -1154,6 +1156,20 @@ async function registerOutboundMessage(chatKey, alias, responseData) {
   }
 }
 
+async function registerOutboundMessageBySessionId(chatKey, sessionInternalId, responseData) {
+  const messageId = responseData?.message_id;
+  const threadId = responseData?.thread_id;
+  if (!messageId && !threadId) {
+    return;
+  }
+  if (messageId) {
+    await store.registerMessageIdById(chatKey, sessionInternalId, messageId).catch(() => {});
+  }
+  if (threadId) {
+    await store.registerThreadIdById(chatKey, sessionInternalId, threadId).catch(() => {});
+  }
+}
+
 async function resetSession(client, event) {
   const chatKey = getChatKey(event);
   await store.resetChat(chatKey);
@@ -1161,7 +1177,8 @@ async function resetSession(client, event) {
 }
 
 async function stopSessionRun(chatKey, alias) {
-  const jobKey = getJobKey(chatKey, alias);
+  const session = store.getSession(chatKey, alias);
+  const jobKey = getJobKey(chatKey, session?.id || alias);
   const child = activeProcesses.get(jobKey);
   if (!child) {
     return false;
@@ -1486,39 +1503,55 @@ async function handleCommand(client, event, text, options = {}) {
 
 async function queueTurn(client, event, prompt, alias) {
   const chatKey = getChatKey(event);
-  const jobKey = getJobKey(chatKey, alias);
+  const initialSession = store.getSession(chatKey, alias);
+  if (!initialSession) {
+    await sendTextMessage(client, event.message.chat_id, `没有找到 ${alias}。发送 /sessions 看最近会话，或 /new 新建一个。`);
+    return;
+  }
+
+  const sessionInternalId = initialSession.id;
+  const jobKey = getJobKey(chatKey, sessionInternalId);
   const prior = activeJobs.get(jobKey) || Promise.resolve();
 
   const next = prior
     .catch(() => {})
     .then(async () => {
-      const session = await store.touchSession(chatKey, alias);
+      const session = await store.touchSessionById(chatKey, sessionInternalId);
+      if (!session) {
+        await logRuntime('agent-turn-session-missing-before-start', {
+          chatKey,
+          alias,
+          sessionInternalId
+        });
+        return;
+      }
       const workspace = session?.workspace || config.defaultWorkspace;
       const provider = session?.provider || config.defaultAgentProvider;
       const rootMessageId = session?.rootMessageId || null;
       const incomingMessageId = getMessageId(event);
+      const liveAlias = session.alias;
       const replyTargetMessageId = incomingMessageId || rootMessageId || null;
       const opening = session?.sessionId
-        ? `已收到，继续 ${alias}（${getProviderLabel(provider)}）处理中。`
-        : `已收到，正在为你启动新的会话 ${alias}（${getProviderLabel(provider)}）。`;
+        ? `已收到，继续 ${liveAlias}（${getProviderLabel(provider)}）处理中。`
+        : `已收到，正在为你启动新的会话 ${liveAlias}（${getProviderLabel(provider)}）。`;
       if (replyTargetMessageId) {
         const reply = await sendTextMessage(client, event.message.chat_id, opening, replyTargetMessageId);
-        await registerOutboundMessage(chatKey, alias, reply);
+        await registerOutboundMessageBySessionId(chatKey, sessionInternalId, reply);
       } else {
         const created = await sendTextMessage(client, event.message.chat_id, opening);
         if (created?.message_id) {
-          await store.updateSession(chatKey, alias, { rootMessageId: created.message_id });
+          await store.updateSessionById(chatKey, sessionInternalId, { rootMessageId: created.message_id });
           session.rootMessageId = created.message_id;
-          await registerOutboundMessage(chatKey, alias, created);
+          await registerOutboundMessageBySessionId(chatKey, sessionInternalId, created);
         }
       }
 
-      await store.appendTurn(chatKey, alias, {
+      await store.appendTurnById(chatKey, sessionInternalId, {
         role: 'user',
         text: prompt,
         createdAt: new Date().toISOString()
       });
-      await store.updateSession(chatKey, alias, {
+      await store.updateSessionById(chatKey, sessionInternalId, {
         status: 'running',
         currentTaskPreview: trimPreview(prompt, 120),
         lastStartedAt: new Date().toISOString()
@@ -1540,7 +1573,7 @@ async function queueTurn(client, event, prompt, alias) {
       const afterSnapshot = await captureWorkspaceSnapshot(workspace);
       const diff = await summarizeWorkspaceChanges(beforeSnapshot, afterSnapshot);
 
-      await store.updateSession(chatKey, alias, {
+      const updatedSession = await store.updateSessionById(chatKey, sessionInternalId, {
         sessionId: result.sessionId,
         provider,
         status: 'idle',
@@ -1554,7 +1587,17 @@ async function queueTurn(client, event, prompt, alias) {
         lastFinishedAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       });
-      await store.appendTurn(chatKey, alias, {
+      if (!updatedSession) {
+        await logRuntime('agent-turn-session-missing-after-run', {
+          chatKey,
+          alias: liveAlias,
+          sessionInternalId,
+          provider,
+          workspace
+        });
+        return;
+      }
+      await store.appendTurnById(chatKey, sessionInternalId, {
         role: 'assistant',
         text: result.output || 'Codex 没有返回正文。',
         createdAt: new Date().toISOString()
@@ -1562,7 +1605,7 @@ async function queueTurn(client, event, prompt, alias) {
 
       const cardReply = await sendResultCard(client, event.message.chat_id, {
         chatKey,
-        alias,
+        alias: updatedSession.alias,
         output: [
           `状态: ${getStatusLabel('success')}`,
           result.output || 'Codex 没有返回正文。',
@@ -1578,21 +1621,21 @@ async function queueTurn(client, event, prompt, alias) {
         commitChange: diff.commitChange,
         title: `${getProviderLabel(provider)} 结果`
       }, replyTargetMessageId || session?.rootMessageId || null);
-      await registerOutboundMessage(chatKey, alias, cardReply);
+      await registerOutboundMessageBySessionId(chatKey, sessionInternalId, cardReply);
     })
     .catch(async (error) => {
-      const currentSession = store.getSession(chatKey, alias);
+      const currentSession = store.getSessionById(chatKey, sessionInternalId);
       const providerLabel = getProviderLabel(currentSession?.provider || config.defaultAgentProvider);
       if (stopRequests.has(jobKey)) {
         stopRequests.delete(jobKey);
-        await store.updateSession(chatKey, alias, {
+        await store.updateSessionById(chatKey, sessionInternalId, {
           status: 'idle',
           currentTaskPreview: '',
           lastResultPreview: '已手动停止当前任务。',
           lastFinishedAt: new Date().toISOString(),
           updatedAt: new Date().toISOString()
         }).catch(() => {});
-        await store.appendTurn(chatKey, alias, {
+        await store.appendTurnById(chatKey, sessionInternalId, {
           role: 'assistant',
           text: '当前任务已手动停止。',
           createdAt: new Date().toISOString()
@@ -1601,7 +1644,8 @@ async function queueTurn(client, event, prompt, alias) {
       }
       await logRuntime('agent-turn-failed', {
         chatKey,
-        alias,
+        alias: currentSession?.alias || alias,
+        sessionInternalId,
         provider: currentSession?.provider || config.defaultAgentProvider,
         workspace: currentSession?.workspace || config.defaultWorkspace,
         error: {
@@ -1611,7 +1655,7 @@ async function queueTurn(client, event, prompt, alias) {
           stack: error?.stack || ''
         }
       });
-      await store.updateSession(chatKey, alias, {
+      await store.updateSessionById(chatKey, sessionInternalId, {
         status: 'error',
         currentTaskPreview: '',
         lastResultPreview: trimPreview(error.stderr || error.message || '未知错误', 120),
@@ -1624,13 +1668,15 @@ async function queueTurn(client, event, prompt, alias) {
         updatedAt: new Date().toISOString()
       }).catch(() => {});
       const detail = (error.stderr || error.message || '未知错误').trim().slice(0, 4000);
-      const errorReply = await sendTextMessage(
-        client,
-        event.message.chat_id,
-        [`${providerLabel} 执行失败。`, '', detail || '没有拿到更多错误信息。', '', '发送 /status 查看当前状态，或 /new 重开会话。'].join('\n'),
-        getMessageId(event) || currentSession?.rootMessageId || null
-      );
-      await registerOutboundMessage(chatKey, alias, errorReply);
+      if (currentSession) {
+        const errorReply = await sendTextMessage(
+          client,
+          event.message.chat_id,
+          [`${providerLabel} 执行失败。`, '', detail || '没有拿到更多错误信息。', '', '发送 /status 查看当前状态，或 /new 重开会话。'].join('\n'),
+          getMessageId(event) || currentSession?.rootMessageId || null
+        );
+        await registerOutboundMessageBySessionId(chatKey, sessionInternalId, errorReply);
+      }
     })
     .finally(() => {
       activeProcesses.delete(jobKey);

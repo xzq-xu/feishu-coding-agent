@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 function normalizeTurns(turns) {
@@ -19,6 +20,7 @@ function normalizeTurns(turns) {
 function normalizeSession(alias, session) {
   const updatedAt = session?.updatedAt || new Date().toISOString();
   return {
+    id: session?.id || randomUUID(),
     alias,
     sessionId: session?.sessionId || null,
     rootMessageId: session?.rootMessageId || null,
@@ -146,6 +148,14 @@ export class SessionStore {
     return record.sessions[alias] || null;
   }
 
+  getSessionById(chatKey, id) {
+    if (!id) {
+      return null;
+    }
+    const record = this.get(chatKey);
+    return Object.values(record.sessions).find((session) => session.id === id) || null;
+  }
+
   async claimProcessedMessage(chatKey, messageId) {
     if (!messageId) {
       return true;
@@ -178,6 +188,10 @@ export class SessionStore {
     )) || null;
   }
 
+  findAliasBySessionId(chatKey, id) {
+    return this.getSessionById(chatKey, id)?.alias || null;
+  }
+
   async registerMessageId(chatKey, alias, messageId) {
     if (!messageId) {
       return null;
@@ -198,6 +212,14 @@ export class SessionStore {
     return session;
   }
 
+  async registerMessageIdById(chatKey, id, messageId) {
+    const alias = this.findAliasBySessionId(chatKey, id);
+    if (!alias) {
+      return null;
+    }
+    return this.registerMessageId(chatKey, alias, messageId);
+  }
+
   async registerThreadId(chatKey, alias, threadId) {
     if (!threadId) {
       return null;
@@ -216,6 +238,14 @@ export class SessionStore {
       await this.flush();
     }
     return session;
+  }
+
+  async registerThreadIdById(chatKey, id, threadId) {
+    const alias = this.findAliasBySessionId(chatKey, id);
+    if (!alias) {
+      return null;
+    }
+    return this.registerThreadId(chatKey, alias, threadId);
   }
 
   async createSession(chatKey) {
@@ -254,6 +284,14 @@ export class SessionStore {
     return session;
   }
 
+  async touchSessionById(chatKey, id) {
+    const alias = this.findAliasBySessionId(chatKey, id);
+    if (!alias) {
+      return null;
+    }
+    return this.touchSession(chatKey, alias);
+  }
+
   async appendTurn(chatKey, alias, turn) {
     const record = this.get(chatKey);
     const session = record.sessions[alias];
@@ -283,6 +321,14 @@ export class SessionStore {
     return session;
   }
 
+  async appendTurnById(chatKey, id, turn) {
+    const alias = this.findAliasBySessionId(chatKey, id);
+    if (!alias) {
+      return null;
+    }
+    return this.appendTurn(chatKey, alias, turn);
+  }
+
   async updateSession(chatKey, alias, updates) {
     const record = this.get(chatKey);
     const session = record.sessions[alias];
@@ -295,6 +341,14 @@ export class SessionStore {
     record.activeAlias = alias;
     await this.flush();
     return session;
+  }
+
+  async updateSessionById(chatKey, id, updates) {
+    const alias = this.findAliasBySessionId(chatKey, id);
+    if (!alias) {
+      return null;
+    }
+    return this.updateSession(chatKey, alias, updates);
   }
 
   async setActiveSession(chatKey, alias) {
