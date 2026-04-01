@@ -35,6 +35,7 @@ function normalizeSession(alias, session) {
     currentStageAt: session?.currentStageAt || null,
     currentActivityPreview: session?.currentActivityPreview || '',
     currentActivityAt: session?.currentActivityAt || null,
+    seedContext: session?.seedContext || '',
     lastResultPreview: session?.lastResultPreview || '',
     lastStartedAt: session?.lastStartedAt || null,
     lastFinishedAt: session?.lastFinishedAt || null,
@@ -48,6 +49,31 @@ function normalizeSession(alias, session) {
     updatedAt,
     turns: normalizeTurns(session?.turns)
   };
+}
+
+function buildForkSeedContext(session, limit = 20) {
+  const turns = normalizeTurns(session?.turns).slice(-limit);
+  if (!turns.length) {
+    return '';
+  }
+
+  const lines = [
+    '以下是 fork 时继承的最近上下文，请先基于这些上下文继续理解任务，再处理本轮新的用户指令：'
+  ];
+
+  for (const turn of turns) {
+    lines.push(`${turn.role === 'assistant' ? '助手' : '用户'}: ${turn.text}`);
+  }
+
+  if (session?.workspace) {
+    lines.push(`工作目录: ${session.workspace}`);
+  }
+
+  if (session?.lastResultPreview) {
+    lines.push(`最近结果摘要: ${session.lastResultPreview}`);
+  }
+
+  return lines.join('\n');
 }
 
 function normalizeChatRecord(chatKey, record) {
@@ -450,6 +476,44 @@ export class SessionStore {
       attached: this.getSession(chatKey, attached.alias),
       sourceRef,
       alreadyAttached: false
+    };
+  }
+
+  async forkSession(chatKey, sourceAlias) {
+    const source = this.getSession(chatKey, sourceAlias);
+    if (!source) {
+      return null;
+    }
+
+    const forked = await this.createSession(chatKey);
+    await this.updateSession(chatKey, forked.alias, {
+      provider: source.provider,
+      workspace: source.workspace,
+      status: 'idle',
+      sessionId: null,
+      currentTaskPreview: '',
+      currentStage: '',
+      currentStageAt: null,
+      currentActivityPreview: '',
+      currentActivityAt: null,
+      seedContext: buildForkSeedContext(source),
+      lastResultPreview: source.lastResultPreview,
+      lastDiffSummary: source.lastDiffSummary,
+      lastDiffPatch: source.lastDiffPatch,
+      lastChangedFiles: source.lastChangedFiles,
+      lastBranchChange: source.lastBranchChange,
+      lastCommitChange: source.lastCommitChange,
+      lastUserMessage: source.lastUserMessage,
+      lastAssistantMessage: source.lastAssistantMessage,
+      turns: source.turns.slice(-40),
+      rootMessageId: null,
+      messageIds: [],
+      threadIds: []
+    });
+
+    return {
+      source,
+      forked: this.getSession(chatKey, forked.alias)
     };
   }
 

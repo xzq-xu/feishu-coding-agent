@@ -427,6 +427,34 @@ async function resolveWorkspaceInput(input) {
   return resolved;
 }
 
+function formatForkWorkspaceSuffix() {
+  const now = new Date();
+  const pad = (value) => String(value).padStart(2, '0');
+  return [
+    now.getFullYear(),
+    pad(now.getMonth() + 1),
+    pad(now.getDate()),
+    '-',
+    pad(now.getHours()),
+    pad(now.getMinutes()),
+    pad(now.getSeconds())
+  ].join('');
+}
+
+async function createForkWorkspace(sourceWorkspace) {
+  const source = await resolveWorkspaceInput(sourceWorkspace);
+  const parentDir = path.dirname(source);
+  const baseName = path.basename(source);
+  const target = path.join(parentDir, `${baseName}-fork-${formatForkWorkspaceSuffix()}`);
+
+  await fs.cp(source, target, {
+    recursive: true,
+    errorOnExist: true
+  });
+
+  return target;
+}
+
 async function parseNewCommand(command) {
   const rest = command.replace(/^\/new\b/i, '').trim();
   if (!rest) {
@@ -1220,6 +1248,7 @@ function formatHelp() {
     '/sessions：查看最近会话（私聊主面板里会显示全局）',
     '/status：查看当前状态（私聊主面板里会显示全局）',
     '/attach <转移ID>：把另一个聊天里的 session 挂接到当前聊天继续',
+    '/fork S1：在主面板里 fork 一个新会话，复制独立工作区，继承最近上下文并自动创建新 topic（删除 session 不会自动删除这个副本目录）',
     '/clean：清空会话。私聊里清空全部，群聊里清空当前群聊',
     '/help：显示帮助'
   ].join('\n');
@@ -1586,6 +1615,66 @@ async function handleCommand(client, event, text, options = {}) {
     return attachSession(client, event, attachMatch[1]);
   }
 
+  const forkMatch = command.match(/^\/fork(?:\s+(S\d+))?$/i);
+  if (forkMatch) {
+    const threadSession = resolveSessionFromThread(chatKey, event);
+    if (threadSession) {
+      await sendCommandReply(client, event, '为避免在现有话题里分叉造成混淆，`/fork` 只能在主面板使用。请回到主面板后发送 `/fork S1`。');
+      return true;
+    }
+
+    const sourceAlias = forkMatch[1]?.toUpperCase() || store.get(chatKey).activeAlias;
+    if (!sourceAlias) {
+      await sendCommandReply(client, event, '当前没有可 fork 的会话。请先发送 `/new ...` 创建一个会话。');
+      return true;
+    }
+
+    const sourceSession = store.getSession(chatKey, sourceAlias);
+    if (!sourceSession) {
+      await sendCommandReply(client, event, `没有找到 ${sourceAlias}。发送 /sessions 看最近会话。`);
+      return true;
+    }
+
+    let forkWorkspace;
+    try {
+      forkWorkspace = await createForkWorkspace(sourceSession.workspace || config.defaultWorkspace);
+    } catch (error) {
+      await sendCommandReply(
+        client,
+        event,
+        `无法为 ${sourceAlias} 复制工作目录：${error.message || String(error)}`
+      );
+      return true;
+    }
+
+    const forkedResult = await store.forkSession(chatKey, sourceAlias);
+    if (!forkedResult) {
+      await sendCommandReply(client, event, `没有找到 ${sourceAlias}。发送 /sessions 看最近会话。`);
+      return true;
+    }
+
+    await store.updateSession(chatKey, forkedResult.forked.alias, {
+      workspace: forkWorkspace
+    });
+    forkedResult.forked = store.getSession(chatKey, forkedResult.forked.alias);
+
+    await ensureSessionRootMessage(client, event, chatKey, forkedResult.forked, { promptQueued: false });
+    await sendCommandReply(
+      client,
+      event,
+      [
+        `已从 ${sourceAlias} fork 出新的会话 ${forkedResult.forked.alias}。`,
+        `Agent: ${getProviderLabel(forkedResult.forked.provider)}`,
+        `工作目录: ${forkedResult.forked.workspace || config.defaultWorkspace}`,
+        '这个新会话会继承原会话最近若干轮上下文，但会从新的底层会话开始。',
+        '我已经在原工作目录的同级目录下复制出一个新的工作区，后续修改会落在这个副本里。',
+        '注意：如果后续删除这个 fork 出来的 session，这个复制出来的工作区也不会自动删除。',
+        `之后你可以直接发送 \`${forkedResult.forked.alias}: 你的新指令\` 继续。`
+      ].join('\n')
+    );
+    return true;
+  }
+
   if (command.toLowerCase() === '/agent') {
     const threadSession = resolveSessionFromThread(chatKey, event);
     const session = threadSession || await store.ensureActiveSession(chatKey);
@@ -1868,6 +1957,9 @@ async function queueTurn(client, event, prompt, alias) {
       const incomingMessageId = getMessageId(event);
       const liveAlias = session.alias;
       const replyTargetMessageId = incomingMessageId || rootMessageId || null;
+      const effectivePrompt = session?.sessionId || !session?.seedContext
+        ? prompt
+        : `${session.seedContext}\n\n当前用户指令: ${prompt}`;
       let latestActivityPreview = '';
       let lastActivityAt = Date.now();
       let lastReportedActivity = '';
@@ -1950,7 +2042,7 @@ async function queueTurn(client, event, prompt, alias) {
         const result = await runAgentTurn({
           provider,
           sessionId: session?.sessionId || null,
-          prompt,
+          prompt: effectivePrompt,
           config: {
             ...config,
             workspace,
@@ -1998,6 +2090,7 @@ async function queueTurn(client, event, prompt, alias) {
           currentStageAt: null,
           currentActivityPreview: '',
           currentActivityAt: null,
+          seedContext: '',
           lastResultPreview: trimPreview(result.output || 'Codex 没有返回正文。', 120),
           lastDiffSummary: diff.summary,
           lastDiffPatch: diff.patch,
