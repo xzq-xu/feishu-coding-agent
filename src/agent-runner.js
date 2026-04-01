@@ -197,7 +197,7 @@ async function runCodexTurn({ sessionId, prompt, config, workspace }) {
   };
 }
 
-async function runPrintAgent({ provider, bin, args, workspace, sessionId }) {
+async function runPrintAgent({ provider, bin, args, workspace, sessionId, config }) {
   const child = spawn(bin, args, {
     cwd: workspace,
     env: process.env,
@@ -237,7 +237,7 @@ async function runPrintAgent({ provider, bin, args, workspace, sessionId }) {
   };
 }
 
-async function runTextAgent({ provider, bin, args, workspace, sessionId }) {
+async function runTextAgent({ provider, bin, args, workspace, sessionId, config }) {
   const child = spawn(bin, args, {
     cwd: workspace,
     env: process.env,
@@ -325,7 +325,7 @@ async function runClaudeTurn({ sessionId, prompt, config, workspace }) {
     args.push('--resume', sessionId);
   }
   args.push(prompt);
-  return runPrintAgent({ provider: 'claude', bin: config.claudeBin, args, workspace, sessionId });
+  return runPrintAgent({ provider: 'claude', bin: config.claudeBin, args, workspace, sessionId, config });
 }
 
 async function runCursorTurn({ sessionId, prompt, config, workspace }) {
@@ -335,7 +335,7 @@ async function runCursorTurn({ sessionId, prompt, config, workspace }) {
     args.push('--model', config.cursorModel);
   }
   args.push(prompt);
-  return runTextAgent({ provider: 'cursor', bin: config.cursorAgentBin, args, workspace, sessionId: chatId });
+  return runTextAgent({ provider: 'cursor', bin: config.cursorAgentBin, args, workspace, sessionId: chatId, config });
 }
 
 async function runOpenCodeTurn({ sessionId, prompt, config, workspace }) {

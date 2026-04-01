@@ -195,7 +195,7 @@ function formatRecentSessions(chatKey) {
   }
 
   const lines = ['最近会话:'];
-  for (const session of sessions) {
+  sessions.forEach((session, index) => {
     const effectiveStatus = getEffectiveSessionStatus(chatKey, session);
     const activeMark = record.activeAlias === session.alias ? ' *' : '';
     const preview = trimPreview(
@@ -207,9 +207,12 @@ function formatRecentSessions(chatKey) {
     const statusText = effectiveStatus === 'running'
       ? `[${formatRunningStatus(session)}]`
       : getStatusBadge(effectiveStatus);
-    lines.push(`${session.alias}${activeMark} ${statusText} [${getProviderLabel(session.provider)}] ${preview}`);
+    lines.push('');
+    lines.push('---');
+    lines.push(`${session.alias}${activeMark} ${statusText} [${getProviderLabel(session.provider)}]`);
+    lines.push(`摘要: ${preview}`);
     lines.push(`工作目录: ${session.workspace || config.defaultWorkspace}`);
-  }
+  });
   return lines.join('\n');
 }
 
@@ -249,7 +252,7 @@ function formatGlobalRecentSessions() {
   }
 
   const lines = ['最近会话:'];
-  for (const { chatKey, activeAlias, session } of uniqueSessions) {
+  uniqueSessions.forEach(({ chatKey, activeAlias, session }, index) => {
     const effectiveStatus = getEffectiveSessionStatus(chatKey, session);
     const activeMark = activeAlias === session.alias ? ' *' : '';
     const preview = trimPreview(
@@ -261,10 +264,14 @@ function formatGlobalRecentSessions() {
     const statusText = effectiveStatus === 'running'
       ? `[${formatRunningStatus(session)}]`
       : getStatusBadge(effectiveStatus);
-    lines.push(`${session.alias}${activeMark} ${statusText} [${getProviderLabel(session.provider)}] [${getChatDisplayName(chatKey)}] ${preview}`);
+    lines.push('');
+    lines.push('---');
+    lines.push(`${session.alias}${activeMark} ${statusText} [${getProviderLabel(session.provider)}]`);
+    lines.push(`聊天: ${getChatDisplayName(chatKey)}`);
+    lines.push(`摘要: ${preview}`);
     lines.push(`工作目录: ${session.workspace || config.defaultWorkspace}`);
     lines.push(`转移 ID: ${session.id}`);
-  }
+  });
 
   return lines.join('\n');
 }
