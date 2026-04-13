@@ -51,6 +51,34 @@ function emitActivity(config, text) {
   config.onActivity?.(summary);
 }
 
+function isIgnorableCodexStderrLine(line) {
+  const normalized = safeTrim(line);
+  if (!normalized) {
+    return true;
+  }
+
+  return (
+    /WARN\s+codex_core::plugins::manifest:/i.test(normalized) ||
+    /WARN\s+codex_core::plugins::manager:/i.test(normalized) ||
+    /WARN\s+codex_core::codex:\s+stream disconnected - retrying sampling request/i.test(normalized) ||
+    /ignoring interface\.defaultPrompt/i.test(normalized) ||
+    /failed to warm featured plugin ids cache/i.test(normalized) ||
+    /<html>/i.test(normalized) ||
+    /Enable JavaScript and cookies to continue/i.test(normalized)
+  );
+}
+
+function emitCodexStderrActivity(config, text) {
+  const lines = String(text || '')
+    .split('\n')
+    .map((line) => safeTrim(line))
+    .filter((line) => line && !isIgnorableCodexStderrLine(line));
+
+  for (const line of lines) {
+    emitActivity(config, line);
+  }
+}
+
 function summarizeCodexEvent(event) {
   if (!event || typeof event !== 'object') {
     return '';
@@ -172,7 +200,7 @@ async function runCodexTurn({ sessionId, prompt, config, workspace }) {
   });
   child.stderr.on('data', (chunk) => {
     stderr += chunk.toString('utf8');
-    emitActivity(config, chunk.toString('utf8'));
+    emitCodexStderrActivity(config, chunk.toString('utf8'));
   });
 
   const exitCode = await collectExit(child);

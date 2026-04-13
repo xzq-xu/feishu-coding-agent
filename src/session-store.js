@@ -3,6 +3,40 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 
+function isProcessAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
+  }
+}
+
+async function readSessionLockFile(lockPath) {
+  try {
+    const raw = await fs.readFile(lockPath, 'utf8');
+    if (!raw.trim()) {
+      return null;
+    }
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+async function isStaleSessionLock(lockPath, staleAfterMs) {
+  try {
+    const stat = await fs.stat(lockPath);
+    return Date.now() - stat.mtimeMs > staleAfterMs;
+  } catch {
+    return false;
+  }
+}
+
 function normalizeTurns(turns) {
   if (!Array.isArray(turns)) {
     return [];
@@ -690,11 +724,16 @@ export class SessionStore {
     this.ensureReady();
     const retryDelayMs = options.retryDelayMs ?? 25;
     const maxAttempts = options.maxAttempts ?? 200;
+    const staleAfterMs = options.staleAfterMs ?? 30000;
 
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       let handle = null;
       try {
         handle = await fs.open(this.lockPath, 'wx');
+        await handle.writeFile(JSON.stringify({
+          pid: process.pid,
+          startedAt: new Date().toISOString()
+        }), 'utf8');
         const result = await action();
         await handle.close();
         await fs.unlink(this.lockPath).catch(() => {});
@@ -706,6 +745,13 @@ export class SessionStore {
         }
         if (error?.code !== 'EEXIST') {
           throw error;
+        }
+
+        const current = await readSessionLockFile(this.lockPath);
+        const stale = await isStaleSessionLock(this.lockPath, staleAfterMs);
+        if ((!current?.pid || !isProcessAlive(current.pid)) && stale) {
+          await fs.unlink(this.lockPath).catch(() => {});
+          continue;
         }
         await sleep(retryDelayMs);
       }
