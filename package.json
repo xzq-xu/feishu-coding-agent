@@ -7,7 +7,11 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "check": "node --check src/*.js"
+    "check": "node --check src/*.js",
+    "schedule": "node src/scheduler.js",
+    "schedule:list": "node src/scheduler.js --list",
+    "schedule:install": "bash scripts/install-schedule.sh",
+    "schedule:uninstall": "bash scripts/install-schedule.sh --uninstall"
   },
   "engines": {
     "node": ">=20"

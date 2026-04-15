@@ -359,6 +359,9 @@ async function runClaudeTurn({ sessionId, prompt, config, workspace }) {
 async function runCursorTurn({ sessionId, prompt, config, workspace }) {
   const chatId = sessionId || await createCursorChat(config, workspace);
   const args = ['-p', '--output-format', 'text', '--force', '--resume', chatId];
+  if (config.cursorMode) {
+    args.push('--mode', config.cursorMode);
+  }
   if (config.cursorModel) {
     args.push('--model', config.cursorModel);
   }
