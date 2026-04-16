@@ -8,6 +8,7 @@ import { runAgentTurn } from './agent-runner.js';
 import { acquireSingleInstanceLock } from './process-lock.js';
 import { SessionStore } from './session-store.js';
 import { captureWorkspaceSnapshot, summarizeWorkspaceChanges } from './workspace-diff.js';
+import { loadTasks, saveTasks, runTask, buildSchedulerResultCard, buildErrorCard, getProviderLabel as getSchedulerProviderLabel, startHeartbeat } from './scheduler.js';
 
 const store = new SessionStore(config.dataDir);
 const activeJobs = new Map();
@@ -1256,6 +1257,11 @@ function formatHelp() {
     '/status：查看当前状态（私聊主面板里会显示全局）',
     '/attach <转移ID>：把另一个聊天里的 session 挂接到当前聊天继续',
     '/fork S1：在主面板里 fork 一个新会话，复制独立工作区，继承最近上下文并自动创建新 topic（删除 session 不会自动删除这个副本目录）',
+    '/cron：查看定时任务列表',
+    '/cron add <调度> <目录> <描述> [--provider X] [--mode plan]：创建定时任务',
+    '/cron run <id>：立即手动执行一个定时任务',
+    '/cron enable <id> / disable <id>：启用或禁用定时任务',
+    '/cron delete <id>：删除定时任务',
     '/clean：清空会话。私聊里清空全部，群聊里清空当前群聊',
     '/help：显示帮助'
   ].join('\n');
@@ -1277,6 +1283,7 @@ function formatUnknownCommand(command) {
     '/diff S1',
     '/sessions',
     '/status',
+    '/cron',
     '/attach <转移ID>',
     '/clean',
     '/help'
@@ -1598,12 +1605,400 @@ function resolveSessionFromThread(chatKey, event) {
   return null;
 }
 
+function parseScheduleShorthand(input) {
+  const token = input.trim().toLowerCase();
+
+  const hourlyMatch = token.match(/^hourly(?:\s+(\d+))?$/);
+  if (hourlyMatch) {
+    const interval = hourlyMatch[1] ? parseInt(hourlyMatch[1], 10) : 1;
+    if (interval < 1 || interval > 23) {
+      return { error: '小时间隔需要在 1-23 之间。' };
+    }
+    const hourField = interval === 1 ? '*' : `*/${interval}`;
+    return { cron: `0 ${hourField} * * *`, label: interval === 1 ? '每小时' : `每 ${interval} 小时` };
+  }
+
+  const dailyMatch = token.match(/^daily(?:\s+(\d{1,2})(?::(\d{2}))?)?$/);
+  if (dailyMatch) {
+    const hour = dailyMatch[1] ? parseInt(dailyMatch[1], 10) : 9;
+    const minute = dailyMatch[2] ? parseInt(dailyMatch[2], 10) : 0;
+    if (hour < 0 || hour > 23) return { error: '小时需要在 0-23 之间。' };
+    if (minute < 0 || minute > 59) return { error: '分钟需要在 0-59 之间。' };
+    return { cron: `${minute} ${hour} * * *`, label: `每天 ${hour}:${String(minute).padStart(2, '0')}` };
+  }
+
+  const weeklyMatch = token.match(/^weekly(?:\s+(\d)(?:\s+(\d{1,2})(?::(\d{2}))?)?)?$/);
+  if (weeklyMatch) {
+    const weekday = weeklyMatch[1] ? parseInt(weeklyMatch[1], 10) : 1;
+    const hour = weeklyMatch[2] ? parseInt(weeklyMatch[2], 10) : 9;
+    const minute = weeklyMatch[3] ? parseInt(weeklyMatch[3], 10) : 0;
+    if (weekday < 0 || weekday > 7) return { error: '星期需要在 0-7 之间（0 和 7 都是周日）。' };
+    if (hour < 0 || hour > 23) return { error: '小时需要在 0-23 之间。' };
+    if (minute < 0 || minute > 59) return { error: '分钟需要在 0-59 之间。' };
+    const dayNames = ['日', '一', '二', '三', '四', '五', '六', '日'];
+    return { cron: `${minute} ${hour} * * ${weekday}`, label: `每周${dayNames[weekday]} ${hour}:${String(minute).padStart(2, '0')}` };
+  }
+
+  return null;
+}
+
+function validateCronExpression(expr) {
+  const parts = expr.trim().split(/\s+/);
+  if (parts.length !== 5) {
+    return '需要 5 个字段：分 时 日 月 周。';
+  }
+
+  const ranges = [
+    { name: '分钟', min: 0, max: 59 },
+    { name: '小时', min: 0, max: 23 },
+    { name: '日', min: 1, max: 31 },
+    { name: '月', min: 1, max: 12 },
+    { name: '星期', min: 0, max: 7 }
+  ];
+
+  for (let i = 0; i < 5; i++) {
+    const field = parts[i];
+    const { name, min, max } = ranges[i];
+    const segments = field.split(',');
+
+    for (const seg of segments) {
+      if (seg === '*') continue;
+
+      const stepMatch = seg.match(/^(\*|\d+(?:-\d+)?)\/(\d+)$/);
+      if (stepMatch) {
+        const step = parseInt(stepMatch[2], 10);
+        if (step < 1 || step > max) return `${name}的步长 ${step} 超出范围 (1-${max})。`;
+        if (stepMatch[1] !== '*') {
+          const base = parseInt(stepMatch[1], 10);
+          if (Number.isNaN(base) || base < min || base > max) return `${name}的值 ${stepMatch[1]} 超出范围 (${min}-${max})。`;
+        }
+        continue;
+      }
+
+      const rangeMatch = seg.match(/^(\d+)-(\d+)$/);
+      if (rangeMatch) {
+        const from = parseInt(rangeMatch[1], 10);
+        const to = parseInt(rangeMatch[2], 10);
+        if (from < min || from > max || to < min || to > max) return `${name}的范围 ${seg} 超出 ${min}-${max}。`;
+        continue;
+      }
+
+      const num = parseInt(seg, 10);
+      if (Number.isNaN(num) || num < min || num > max) return `${name}的值 "${seg}" 无效 (${min}-${max})。`;
+    }
+  }
+
+  return null;
+}
+
+function generateTaskId(existingIds) {
+  let maxNum = 0;
+  for (const id of existingIds) {
+    const m = id.match(/^C(\d+)$/i);
+    if (m) maxNum = Math.max(maxNum, parseInt(m[1], 10));
+  }
+  return `C${maxNum + 1}`;
+}
+
+const VALID_PROVIDERS = new Set(['cursor', 'codex', 'claude', 'opencode']);
+const VALID_MODES = new Set(['plan', 'normal']);
+
+function extractCronFlags(tokens) {
+  const flags = {};
+  const remaining = [];
+  for (let i = 0; i < tokens.length; i++) {
+    if (tokens[i] === '--provider' && i + 1 < tokens.length) {
+      flags.provider = tokens[i + 1].toLowerCase();
+      i++;
+    } else if (tokens[i] === '--mode' && i + 1 < tokens.length) {
+      flags.mode = tokens[i + 1].toLowerCase();
+      i++;
+    } else {
+      remaining.push(tokens[i]);
+    }
+  }
+  if (flags.provider && !VALID_PROVIDERS.has(flags.provider)) {
+    return { error: `不支持的 provider \`${flags.provider}\`。可选: ${[...VALID_PROVIDERS].join(', ')}` };
+  }
+  if (flags.mode && !VALID_MODES.has(flags.mode)) {
+    return { error: `不支持的 mode \`${flags.mode}\`。可选: plan（只读审查）、normal（默认）` };
+  }
+  return { flags, remaining };
+}
+
+function parseCronAddArgs(input) {
+  const rawTokens = tokenizeCommandArgs(input);
+  const extracted = extractCronFlags(rawTokens);
+  if (extracted.error) return { error: extracted.error };
+  const { flags, remaining: tokens } = extracted;
+
+  if (tokens.length < 2) {
+    return { error: 'need_more_args' };
+  }
+
+  function buildResult(schedule, scheduleLabel, workspace, prompt) {
+    return { schedule, scheduleLabel, workspace, prompt, ...flags };
+  }
+
+  for (let n = Math.min(3, tokens.length - 2); n >= 1; n--) {
+    const candidate = tokens.slice(0, n).join(' ');
+    const shorthand = parseScheduleShorthand(candidate);
+    if (shorthand?.error) return { error: shorthand.error };
+    if (shorthand) {
+      if (tokens.length < n + 2) return { error: 'need_more_args' };
+      return buildResult(shorthand.cron, shorthand.label, tokens[n], tokens.slice(n + 1).join(' '));
+    }
+  }
+
+  return { error: 'bad_schedule' };
+}
+
+async function handleCronCommand(client, event, command) {
+  const rest = command.replace(/^\/cron\b/i, '').trim();
+
+  let tasks;
+  try {
+    tasks = await loadTasks();
+  } catch {
+    tasks = [];
+  }
+
+  if (!rest || rest.toLowerCase() === 'list') {
+    if (!tasks.length) {
+      await sendCommandReply(client, event, '当前没有定义任何定时任务。');
+      return;
+    }
+    const lines = [`共 ${tasks.length} 个定时任务:\n`];
+    for (const task of tasks) {
+      const status = task.enabled ? '✓ 已启用' : '✗ 已禁用';
+      lines.push(`**${task.id}** [${status}]`);
+      lines.push(`  Agent: ${getSchedulerProviderLabel(task.provider)}  调度: \`${task.schedule}\``);
+      lines.push(`  目录: \`${task.workspace}\``);
+      lines.push('');
+    }
+    lines.push('可用命令:');
+    lines.push('`/cron add <调度> <目录> <任务描述> [选项]` 创建');
+    lines.push('`/cron run <id>` 立即执行');
+    lines.push('`/cron enable <id>` / `disable <id>` 启用/禁用');
+    lines.push('`/cron delete <id>` 删除');
+    await sendCommandReply(client, event, lines.join('\n'));
+    return;
+  }
+
+  if (rest.toLowerCase().startsWith('add')) {
+    const addArgs = rest.replace(/^add\b/i, '').trim();
+    if (!addArgs) {
+      await sendCommandReply(client, event, [
+        '用法: `/cron add <调度> <工作目录> <任务描述> [选项]`',
+        '',
+        '必填参数:',
+        '  `<调度>` — 执行频率（见下方格式）',
+        '  `<工作目录>` — Agent 执行的项目目录路径',
+        '  `<任务描述>` — 发给 Agent 的指令内容',
+        '',
+        '可选参数:',
+        '  `--provider <名称>` — Agent 类型（cursor/codex/claude/opencode），默认跟随全局配置',
+        '  `--mode plan` — 只读审查模式，Agent 只分析不改代码',
+        '',
+        '自动填充:',
+        '  `id` — 自动递增（C1、C2、C3…）',
+        '  `reportTo` — 自动使用当前聊天，结果推送到这里',
+        '  `enabled` — 默认启用',
+        '',
+        '调度格式:',
+        '  `hourly` — 每小时（整点执行）',
+        '  `hourly N` — 每 N 小时（如 `hourly 4` = 每 4 小时）',
+        '  `daily` — 每天 9:00',
+        '  `daily H` — 每天 H 点（如 `daily 14` = 每天 14:00）',
+        '  `daily H:MM` — 每天 H:MM（如 `daily 14:30`）',
+        '  `weekly` — 每周一 9:00',
+        '  `weekly D` — 每周 D 的 9:00（D: 0=周日, 1=周一, …6=周六）',
+        '  `weekly D H` — 每周 D 的 H 点（如 `weekly 1 10` = 每周一 10:00）',
+        '',
+        '示例:',
+        '`/cron add daily /Users/yumeng/q-skill 审查最近的代码变更`',
+        '`/cron add hourly 4 /Users/yumeng/project 跑一次测试`',
+        '`/cron add daily 14 /path/to/repo 审查代码 --mode plan`',
+        '`/cron add weekly 1 9 /Users/yumeng/project 每周一审查代码`'
+      ].join('\n'));
+      return;
+    }
+
+    const parsed = parseCronAddArgs(addArgs);
+    if (parsed.error === 'need_more_args') {
+      await sendCommandReply(client, event, '参数不足。格式: `/cron add <调度> <工作目录> <任务描述>`\n发送 `/cron add` 查看详细用法。');
+      return;
+    }
+    if (parsed.error === 'bad_schedule') {
+      await sendCommandReply(client, event, '无法识别调度格式。支持 `hourly`、`hourly 4`、`daily`、`daily 14`、`weekly 1 10` 等。\n发送 `/cron add` 查看详细用法。');
+      return;
+    }
+    if (parsed.error) {
+      await sendCommandReply(client, event, `调度格式错误: ${parsed.error}`);
+      return;
+    }
+
+    let workspace;
+    try {
+      workspace = await resolveWorkspaceInput(parsed.workspace);
+    } catch (error) {
+      await sendCommandReply(client, event, error.message || '工作目录无效。');
+      return;
+    }
+
+    const existingIds = new Set(tasks.map((t) => t.id));
+    const taskId = generateTaskId(existingIds);
+    const provider = parsed.provider || config.defaultAgentProvider;
+    const chatId = event?.message?.chat_id || '';
+    const newTask = {
+      id: taskId,
+      enabled: true,
+      schedule: parsed.schedule,
+      provider,
+      workspace,
+      prompt: parsed.prompt,
+      reportTo: chatId
+    };
+    if (parsed.mode === 'plan') {
+      newTask.mode = 'plan';
+    }
+    tasks.push(newTask);
+    await saveTasks(tasks);
+
+    const lines = [
+      `已创建定时任务 \`${taskId}\``,
+      '',
+      `调度: \`${parsed.schedule}\`（${parsed.scheduleLabel}）`,
+      `Agent: ${getSchedulerProviderLabel(newTask.provider)}`,
+    ];
+    if (newTask.mode) lines.push(`模式: \`${newTask.mode}\`（只读审查）`);
+    lines.push(`目录: \`${workspace}\``);
+    if (chatId) lines.push(`结果推送: 当前聊天`);
+
+    await sendCommandReply(client, event, [
+      ...lines,
+      '',
+      `立即测试: \`/cron run ${taskId}\``
+    ].join('\n'));
+    return;
+  }
+
+  const deleteMatch = rest.match(/^delete\s+(\S+)$/i);
+  if (deleteMatch) {
+    const taskId = deleteMatch[1];
+    const index = tasks.findIndex((t) => t.id === taskId);
+    if (index < 0) {
+      await sendCommandReply(client, event, `未找到任务 \`${taskId}\`。`);
+      return;
+    }
+    tasks.splice(index, 1);
+    await saveTasks(tasks);
+    await sendCommandReply(client, event, `已删除任务 \`${taskId}\`。`);
+    return;
+  }
+
+  const runMatch = rest.match(/^run\s+(\S+)$/i);
+  if (runMatch) {
+    const taskId = runMatch[1];
+    const task = tasks.find((t) => t.id === taskId);
+    if (!task) {
+      await sendCommandReply(client, event, `未找到任务 \`${taskId}\`。\n可用任务: ${tasks.map((t) => t.id).join(', ')}`);
+      return;
+    }
+
+    await sendCommandReply(client, event, `开始执行定时任务 \`${task.id}\`（${getSchedulerProviderLabel(task.provider)}），请稍候...`);
+
+    const startMs = Date.now();
+    let result;
+    try {
+      result = await runTask(task);
+    } catch (error) {
+      result = {
+        success: false,
+        error,
+        elapsed: formatElapsedDuration(startMs),
+        output: null,
+        diff: null
+      };
+    }
+
+    let card;
+    if (result.success) {
+      card = buildSchedulerResultCard(task, result.output, result.elapsed, result.diff);
+    } else {
+      card = buildErrorCard(task, result.error || { message: '未知错误' }, result.elapsed);
+    }
+
+    await client.im.v1.message.create({
+      params: { receive_id_type: 'chat_id' },
+      data: {
+        receive_id: event.message.chat_id,
+        msg_type: 'interactive',
+        content: JSON.stringify(card)
+      }
+    });
+    return;
+  }
+
+  const enableMatch = rest.match(/^enable\s+(\S+)$/i);
+  if (enableMatch) {
+    const taskId = enableMatch[1];
+    const task = tasks.find((t) => t.id === taskId);
+    if (!task) {
+      await sendCommandReply(client, event, `未找到任务 \`${taskId}\`。`);
+      return;
+    }
+    if (task.enabled) {
+      await sendCommandReply(client, event, `任务 \`${taskId}\` 已经是启用状态。`);
+      return;
+    }
+    task.enabled = true;
+    await saveTasks(tasks);
+    await sendCommandReply(client, event, `已启用任务 \`${taskId}\`。`);
+    return;
+  }
+
+  const disableMatch = rest.match(/^disable\s+(\S+)$/i);
+  if (disableMatch) {
+    const taskId = disableMatch[1];
+    const task = tasks.find((t) => t.id === taskId);
+    if (!task) {
+      await sendCommandReply(client, event, `未找到任务 \`${taskId}\`。`);
+      return;
+    }
+    if (!task.enabled) {
+      await sendCommandReply(client, event, `任务 \`${taskId}\` 已经是禁用状态。`);
+      return;
+    }
+    task.enabled = false;
+    await saveTasks(tasks);
+    await sendCommandReply(client, event, `已禁用任务 \`${taskId}\`。`);
+    return;
+  }
+
+  await sendCommandReply(client, event, [
+    '定时任务命令:',
+    '`/cron` — 查看所有任务',
+    '`/cron add <调度> <目录> <描述> [--provider X] [--mode plan]` — 创建任务',
+    '`/cron run <id>` — 立即执行',
+    '`/cron enable <id>` / `disable <id>` — 启用/禁用',
+    '`/cron delete <id>` — 删除任务',
+    '',
+    '发送 `/cron add` 查看完整参数说明和示例。'
+  ].join('\n'));
+}
+
 async function handleCommand(client, event, text, options = {}) {
   const command = text.trim();
   const chatKey = getChatKey(event);
 
   if (command.toLowerCase() === '/help') {
     await sendCommandReply(client, event, formatHelp());
+    return true;
+  }
+
+  if (command.toLowerCase().startsWith('/cron')) {
+    await handleCronCommand(client, event, command);
     return true;
   }
 
@@ -2568,6 +2963,12 @@ async function main() {
 
   wsClient.start({
     eventDispatcher: dispatcher
+  });
+
+  startHeartbeat({
+    onTaskResult: (task, result) => {
+      console.log(`[heartbeat] 任务 [${task.id}] ${result.success ? '完成' : '失败'} (${result.elapsed})`);
+    }
   });
 
   process.on('unhandledRejection', (reason) => {
