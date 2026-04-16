@@ -5,7 +5,6 @@
       "enabled": true,
       "schedule": "0 9 * * *",
       "provider": "cursor",
-      "mode": "plan",
       "workspace": "/Users/yumeng/q-skill",
       "prompt": "审查最近的代码变更，检查是否有潜在 bug、命名不规范、缺少错误处理等问题。给出具体的改进建议。",
       "reportTo": ""

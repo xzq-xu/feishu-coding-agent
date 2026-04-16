@@ -44,7 +44,7 @@
 - `/status` 查看当前状态；私聊主面板里显示全局
 - `/clean` 清空会话；私聊里清空全部，群聊里清空当前群聊
 - `/cron` 查看定时任务列表
-- `/cron add <调度> <目录> <描述> [--provider X] [--mode plan]` 创建定时任务
+- `/cron add <调度> <目录> <描述> [--provider X]` 创建定时任务
 - `/cron run <id>` 立即手动执行一个定时任务
 - `/cron enable <id>` 启用定时任务
 - `/cron disable <id>` 禁用定时任务
@@ -360,7 +360,6 @@ vi data/scheduled-tasks.json
       "enabled": true,
       "schedule": "0 9 * * *",
       "provider": "cursor",
-      "mode": "plan",
       "workspace": "/Users/yumeng/q-skill",
       "prompt": "审查最近的代码变更，给出改进建议。",
       "reportTo": "",
@@ -377,7 +376,6 @@ vi data/scheduled-tasks.json
 | `workspace` | **是** | Agent 执行的项目目录绝对路径 | — |
 | `prompt` | **是** | 发给 Agent 的指令内容 | — |
 | `provider` | 否 | Agent 类型：`cursor` / `codex` / `claude` / `opencode` | 跟随 `AGENT_PROVIDER` 环境变量 |
-| `mode` | 否 | `"plan"` 表示只读审查模式，Agent 只分析不改代码 | 不设置 = 正常模式 |
 | `id` | 否 | 任务唯一标识，格式为 C1、C2、C3… | `/cron add` 时自动递增生成 |
 | `enabled` | 否 | 是否启用 | `true` |
 | `reportTo` | 否 | 飞书聊天 ID，结果推送目标 | `/cron add` 时自动填为当前聊天；留空则使用 `DEFAULT_REPORT_CHAT_ID` |
@@ -416,13 +414,13 @@ npm run schedule:uninstall
 在飞书聊天中可直接管理定时任务：
 
 - `/cron` — 查看所有任务
-- `/cron add <调度> <目录> <描述> [--provider X] [--mode plan]` — 创建任务
+- `/cron add <调度> <目录> <描述> [--provider X]` — 创建任务
 - `/cron run <id>` — 立即手动执行
 - `/cron enable <id>` — 启用任务
 - `/cron disable <id>` — 禁用任务
 - `/cron delete <id>` — 删除任务
 
-创建任务时，只需提供**调度**、**工作目录**、**任务描述**三个必填参数。`id`、`enabled`、`reportTo` 等字段自动填充（`reportTo` 默认为当前聊天）。可通过 `--provider` 和 `--mode` 覆盖默认值。
+创建任务时，只需提供**调度**、**工作目录**、**任务描述**三个必填参数。`id`、`enabled`、`reportTo` 等字段自动填充（`reportTo` 默认为当前聊天）。可通过 `--provider` 指定 Agent 类型。
 
 调度格式：
 
@@ -442,7 +440,7 @@ npm run schedule:uninstall
 ```text
 /cron add daily /Users/yumeng/q-skill 审查最近的代码变更，给出改进建议
 /cron add hourly 4 /Users/yumeng/project 跑一次测试，分析失败原因
-/cron add daily 14 /Users/yumeng/q-skill 审查代码 --mode plan
+/cron add daily 14 /Users/yumeng/q-skill 审查代码 --provider cursor
 /cron add weekly 1 9 /Users/yumeng/project 每周一审查代码 --provider codex
 ```
 

@@ -1258,7 +1258,7 @@ function formatHelp() {
     '/attach <转移ID>：把另一个聊天里的 session 挂接到当前聊天继续',
     '/fork S1：在主面板里 fork 一个新会话，复制独立工作区，继承最近上下文并自动创建新 topic（删除 session 不会自动删除这个副本目录）',
     '/cron：查看定时任务列表',
-    '/cron add <调度> <目录> <描述> [--provider X] [--mode plan]：创建定时任务',
+    '/cron add <调度> <目录> <描述> [--provider X]：创建定时任务',
     '/cron run <id>：立即手动执行一个定时任务',
     '/cron enable <id> / disable <id>：启用或禁用定时任务',
     '/cron delete <id>：删除定时任务',
@@ -1701,7 +1701,6 @@ function generateTaskId(existingIds) {
 }
 
 const VALID_PROVIDERS = new Set(['cursor', 'codex', 'claude', 'opencode']);
-const VALID_MODES = new Set(['plan', 'normal']);
 
 function extractCronFlags(tokens) {
   const flags = {};
@@ -1710,18 +1709,12 @@ function extractCronFlags(tokens) {
     if (tokens[i] === '--provider' && i + 1 < tokens.length) {
       flags.provider = tokens[i + 1].toLowerCase();
       i++;
-    } else if (tokens[i] === '--mode' && i + 1 < tokens.length) {
-      flags.mode = tokens[i + 1].toLowerCase();
-      i++;
     } else {
       remaining.push(tokens[i]);
     }
   }
   if (flags.provider && !VALID_PROVIDERS.has(flags.provider)) {
     return { error: `不支持的 provider \`${flags.provider}\`。可选: ${[...VALID_PROVIDERS].join(', ')}` };
-  }
-  if (flags.mode && !VALID_MODES.has(flags.mode)) {
-    return { error: `不支持的 mode \`${flags.mode}\`。可选: plan（只读审查）、normal（默认）` };
   }
   return { flags, remaining };
 }
@@ -1798,7 +1791,6 @@ async function handleCronCommand(client, event, command) {
         '',
         '可选参数:',
         '  `--provider <名称>` — Agent 类型（cursor/codex/claude/opencode），默认跟随全局配置',
-        '  `--mode plan` — 只读审查模式，Agent 只分析不改代码',
         '',
         '自动填充:',
         '  `id` — 自动递增（C1、C2、C3…）',
@@ -1818,7 +1810,7 @@ async function handleCronCommand(client, event, command) {
         '示例:',
         '`/cron add daily /Users/yumeng/q-skill 审查最近的代码变更`',
         '`/cron add hourly 4 /Users/yumeng/project 跑一次测试`',
-        '`/cron add daily 14 /path/to/repo 审查代码 --mode plan`',
+        '`/cron add daily 14 /path/to/repo 审查代码 --provider cursor`',
         '`/cron add weekly 1 9 /Users/yumeng/project 每周一审查代码`'
       ].join('\n'));
       return;
@@ -1859,9 +1851,6 @@ async function handleCronCommand(client, event, command) {
       prompt: parsed.prompt,
       reportTo: chatId
     };
-    if (parsed.mode === 'plan') {
-      newTask.mode = 'plan';
-    }
     tasks.push(newTask);
     await saveTasks(tasks);
 
@@ -1871,7 +1860,6 @@ async function handleCronCommand(client, event, command) {
       `调度: \`${parsed.schedule}\`（${parsed.scheduleLabel}）`,
       `Agent: ${getSchedulerProviderLabel(newTask.provider)}`,
     ];
-    if (newTask.mode) lines.push(`模式: \`${newTask.mode}\`（只读审查）`);
     lines.push(`目录: \`${workspace}\``);
     if (chatId) lines.push(`结果推送: 当前聊天`);
 
@@ -1979,7 +1967,7 @@ async function handleCronCommand(client, event, command) {
   await sendCommandReply(client, event, [
     '定时任务命令:',
     '`/cron` — 查看所有任务',
-    '`/cron add <调度> <目录> <描述> [--provider X] [--mode plan]` — 创建任务',
+    '`/cron add <调度> <目录> <描述> [--provider X]` — 创建任务',
     '`/cron run <id>` — 立即执行',
     '`/cron enable <id>` / `disable <id>` — 启用/禁用',
     '`/cron delete <id>` — 删除任务',

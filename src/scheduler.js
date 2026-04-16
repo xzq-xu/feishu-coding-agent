@@ -154,13 +154,15 @@ export function cronMatchesNow(cronExpr, now = new Date()) {
   const month = now.getMonth() + 1;
   const dayOfWeek = now.getDay();
 
+  const dowMatch = matchCronField(parts[4], dayOfWeek)
+    || (dayOfWeek === 0 && matchCronField(parts[4], 7));
+
   return (
     matchCronField(parts[0], minute) &&
     matchCronField(parts[1], hour) &&
     matchCronField(parts[2], dayOfMonth) &&
     matchCronField(parts[3], month) &&
-    matchCronField(parts[4], dayOfWeek) &&
-    matchCronField(parts[4], dayOfWeek === 0 ? 7 : dayOfWeek)
+    dowMatch
   );
 }
 
@@ -253,7 +255,6 @@ export function buildSchedulerResultCard(task, output, elapsed, diff) {
       content: [
         `**任务 ID**: ${task.id}`,
         `**Agent**: ${getProviderLabel(task.provider)}`,
-        task.mode ? `**模式**: ${task.mode}` : null,
         `**工作目录**: \`${task.workspace}\``,
         `**执行耗时**: ${elapsed}`,
         `**调度规则**: \`${task.schedule}\``,
@@ -336,10 +337,6 @@ export async function runTask(task, options = {}) {
     workspace
   };
 
-  if (task.mode === 'plan') {
-    agentConfig.cursorMode = 'plan';
-  }
-
   const beforeSnapshot = await captureWorkspaceSnapshot(workspace);
 
   const result = await runAgentTurn({
@@ -394,7 +391,7 @@ async function main() {
       const status = task.enabled ? '✓ 已启用' : '✗ 已禁用';
       console.log(`  [${task.id}] ${status}`);
       console.log(`    调度:     ${task.schedule}`);
-      console.log(`    Agent:    ${getProviderLabel(task.provider)}${task.mode ? `  模式: ${task.mode}` : ''}`);
+      console.log(`    Agent:    ${getProviderLabel(task.provider)}`);
       console.log(`    目录:     ${task.workspace}`);
       console.log(`    指令:     ${(task.prompt || '').slice(0, 80)}${(task.prompt || '').length > 80 ? '...' : ''}`);
       console.log(`    推送到:   ${task.reportTo || '(使用 DEFAULT_REPORT_CHAT_ID 或仅 stdout)'}`);
@@ -426,7 +423,6 @@ async function main() {
     console.log('  workspace  [必填] Agent 执行的项目目录绝对路径');
     console.log('  prompt     [必填] 发给 Agent 的指令内容');
     console.log('  provider   [可选] Agent 类型: cursor/codex/claude/opencode（默认跟随 AGENT_PROVIDER）');
-    console.log('  mode       [可选] "plan" 只读审查模式，Agent 只分析不改代码');
     console.log('  id         [可选] 任务唯一标识（通过 /cron add 创建时自动生成）');
     console.log('  enabled    [可选] 是否启用（默认 true）');
     console.log('  reportTo   [可选] 飞书聊天 ID，结果推送目标（留空使用 DEFAULT_REPORT_CHAT_ID）');
@@ -475,7 +471,10 @@ async function main() {
   await appendLog('调度器本轮执行完成');
 }
 
-main().catch((error) => {
-  console.error('调度器异常退出:', error);
-  process.exit(1);
-});
+const isDirectRun = process.argv[1] && import.meta.url.endsWith(process.argv[1].replace(/.*\//, ''));
+if (isDirectRun) {
+  main().catch((error) => {
+    console.error('调度器异常退出:', error);
+    process.exit(1);
+  });
+}
