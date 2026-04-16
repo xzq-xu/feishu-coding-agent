@@ -7,7 +7,9 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "check": "node --check src/*.js"
+    "check": "node --check src/*.js",
+    "schedule": "node src/scheduler.js",
+    "schedule:list": "node src/scheduler.js --list"
   },
   "engines": {
     "node": ">=20"

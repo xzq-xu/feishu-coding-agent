@@ -1,0 +1,22 @@
+{
+  "tasks": [
+    {
+      "id": "C1",
+      "enabled": true,
+      "schedule": "0 9 * * *",
+      "provider": "cursor",
+      "workspace": "/Users/yumeng/q-skill",
+      "prompt": "审查最近的代码变更，检查是否有潜在 bug、命名不规范、缺少错误处理等问题。给出具体的改进建议。",
+      "reportTo": ""
+    },
+    {
+      "id": "C2",
+      "enabled": true,
+      "schedule": "0 */4 * * *",
+      "provider": "cursor",
+      "workspace": "/Users/yumeng/Documents/Projects/feishu-coding-agent",
+      "prompt": "运行 npm test，如果有失败的测试，分析失败原因并给出修复建议。不要自动修改代码。",
+      "reportTo": ""
+    }
+  ]
+}

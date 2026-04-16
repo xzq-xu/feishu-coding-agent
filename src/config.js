@@ -48,6 +48,7 @@ export const config = {
   cursorModel: process.env.CURSOR_MODEL || '',
   opencodeBin: process.env.OPENCODE_BIN || 'opencode',
   opencodeModel: process.env.OPENCODE_MODEL || '',
+  defaultReportChatId: process.env.DEFAULT_REPORT_CHAT_ID || '',
   botLocale: process.env.BOT_LOCALE || 'zh-CN',
   dataDir: path.resolve(process.cwd(), 'data'),
   downloadsDir: path.resolve(process.cwd(), 'data', 'downloads'),
