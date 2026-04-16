@@ -396,19 +396,6 @@ node src/scheduler.js --all
 node src/scheduler.js --list
 ```
 
-### 安装到系统 cron
-
-```bash
-# 安装
-npm run schedule:install
-
-# 查看当前 crontab
-crontab -l
-
-# 卸载
-npm run schedule:uninstall
-```
-
 ### 飞书内管理
 
 在飞书聊天中可直接管理定时任务：
@@ -452,7 +439,6 @@ src/agent-runner.js    Agent 执行器抽象，支持 Codex / Claude / Cursor / 
 src/session-store.js   聊天到多个 Agent 会话的持久化映射
 src/scheduler.js       定时任务调度入口
 src/index.js           飞书长连接入口
-scripts/install-schedule.sh  cron 安装/卸载辅助脚本
 data/sessions.json     运行时自动生成
 data/scheduled-tasks.json    定时任务定义（需手动创建）
 ```

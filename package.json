@@ -9,9 +9,7 @@
     "dev": "node --watch src/index.js",
     "check": "node --check src/*.js",
     "schedule": "node src/scheduler.js",
-    "schedule:list": "node src/scheduler.js --list",
-    "schedule:install": "bash scripts/install-schedule.sh",
-    "schedule:uninstall": "bash scripts/install-schedule.sh --uninstall"
+    "schedule:list": "node src/scheduler.js --list"
   },
   "engines": {
     "node": ">=20"
