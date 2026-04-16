@@ -36,10 +36,15 @@ function parseArgs(argv) {
   return result;
 }
 
-async function loadTasks() {
+export async function loadTasks() {
   const raw = await fs.readFile(TASKS_FILE, 'utf8');
   const data = JSON.parse(raw);
   return Array.isArray(data.tasks) ? data.tasks : [];
+}
+
+export async function saveTasks(tasks) {
+  await fs.mkdir(config.dataDir, { recursive: true });
+  await fs.writeFile(TASKS_FILE, JSON.stringify({ tasks }, null, 2) + '\n', 'utf8');
 }
 
 async function appendLog(message) {
@@ -113,7 +118,112 @@ async function sendFeishuText(token, chatId, text) {
   return payload;
 }
 
-function getProviderLabel(provider) {
+function matchCronField(field, value) {
+  for (const segment of field.split(',')) {
+    const stepMatch = segment.match(/^(\*|\d+(?:-\d+)?)\/(\d+)$/);
+    if (stepMatch) {
+      const step = parseInt(stepMatch[2], 10);
+      if (stepMatch[1] === '*') {
+        if (value % step === 0) return true;
+      } else {
+        const base = parseInt(stepMatch[1], 10);
+        if (value >= base && (value - base) % step === 0) return true;
+      }
+      continue;
+    }
+    if (segment === '*') return true;
+    const rangeMatch = segment.match(/^(\d+)-(\d+)$/);
+    if (rangeMatch) {
+      const from = parseInt(rangeMatch[1], 10);
+      const to = parseInt(rangeMatch[2], 10);
+      if (value >= from && value <= to) return true;
+      continue;
+    }
+    if (parseInt(segment, 10) === value) return true;
+  }
+  return false;
+}
+
+export function cronMatchesNow(cronExpr, now = new Date()) {
+  const parts = cronExpr.trim().split(/\s+/);
+  if (parts.length !== 5) return false;
+
+  const minute = now.getMinutes();
+  const hour = now.getHours();
+  const dayOfMonth = now.getDate();
+  const month = now.getMonth() + 1;
+  const dayOfWeek = now.getDay();
+
+  return (
+    matchCronField(parts[0], minute) &&
+    matchCronField(parts[1], hour) &&
+    matchCronField(parts[2], dayOfMonth) &&
+    matchCronField(parts[3], month) &&
+    matchCronField(parts[4], dayOfWeek) &&
+    matchCronField(parts[4], dayOfWeek === 0 ? 7 : dayOfWeek)
+  );
+}
+
+const runningTasks = new Set();
+
+export function startHeartbeat({ onTaskResult, intervalMs = 60_000 } = {}) {
+  let lastCheckMinute = -1;
+
+  const timer = setInterval(async () => {
+    const now = new Date();
+    const currentMinute = now.getHours() * 60 + now.getMinutes();
+    if (currentMinute === lastCheckMinute) return;
+    lastCheckMinute = currentMinute;
+
+    let tasks;
+    try {
+      tasks = await loadTasks();
+    } catch {
+      return;
+    }
+
+    for (const task of tasks) {
+      if (!task.enabled || !task.schedule) continue;
+      if (runningTasks.has(task.id)) continue;
+      if (!cronMatchesNow(task.schedule, now)) continue;
+
+      runningTasks.add(task.id);
+      await appendLog(`[heartbeat] 触发任务 [${task.id}]`);
+
+      (async () => {
+        const startMs = Date.now();
+        let result;
+        try {
+          result = await runTask(task);
+        } catch (error) {
+          result = { success: false, error, elapsed: formatElapsed(startMs), output: null, diff: null };
+        }
+
+        try {
+          await reportToFeishu(task, result);
+        } catch (error) {
+          await appendLog(`[heartbeat] 任务 [${task.id}] 飞书推送失败: ${error.message}`);
+        }
+
+        if (onTaskResult) {
+          try { onTaskResult(task, result); } catch { /* ignore */ }
+        }
+
+        await appendLog(`[heartbeat] 任务 [${task.id}] 完成 elapsed=${result.elapsed}`);
+      })().catch((error) => {
+        appendLog(`[heartbeat] 任务 [${task.id}] 异常: ${error.message}`).catch(() => {});
+      }).finally(() => {
+        runningTasks.delete(task.id);
+      });
+    }
+  }, intervalMs);
+
+  timer.unref?.();
+  appendLog('[heartbeat] 调度引擎已启动').catch(() => {});
+  return timer;
+}
+
+export function getProviderLabel(provider) {
   switch ((provider || '').toLowerCase()) {
     case 'claude': return 'Claude Code';
     case 'cursor': return 'Cursor Agent';
@@ -131,7 +241,7 @@ function formatElapsed(startMs) {
   return `${minutes} 分 ${remainingSeconds} 秒`;
 }
 
-function buildSchedulerResultCard(task, output, elapsed, diff) {
+export function buildSchedulerResultCard(task, output, elapsed, diff) {
   const elements = [
     {
       tag: 'markdown',
@@ -147,7 +257,7 @@ function buildSchedulerResultCard(task, output, elapsed, diff) {
         `**工作目录**: \`${task.workspace}\``,
         `**执行耗时**: ${elapsed}`,
         `**调度规则**: \`${task.schedule}\``,
-        `**描述**: ${task.description || '无'}`
+        `**指令**: ${(task.prompt || '').slice(0, 100)}${(task.prompt || '').length > 100 ? '...' : ''}`
       ].filter(Boolean).join('\n')
     }
   ];
@@ -173,7 +283,7 @@ function buildSchedulerResultCard(task, output, elapsed, diff) {
   };
 }
 
-function buildErrorCard(task, error, elapsed) {
+export function buildErrorCard(task, error, elapsed) {
   return {
     config: { wide_screen_mode: true },
     header: {
@@ -206,7 +316,7 @@ function buildErrorCard(task, error, elapsed) {
   };
 }
 
-async function runTask(task, options = {}) {
+export async function runTask(task, options = {}) {
   const { dryRun = false } = options;
   const startMs = Date.now();
   const provider = task.provider || config.defaultAgentProvider;
@@ -249,20 +359,21 @@ async function runTask(task, options = {}) {
 }
 
 async function reportToFeishu(task, result) {
-  if (!task.reportTo) {
-    console.log(`任务 [${task.id}] 没有配置 reportTo，跳过飞书推送。结果已输出到 stdout。`);
+  const chatId = task.reportTo || config.defaultReportChatId;
+  if (!chatId) {
+    console.log(`任务 [${task.id}] 没有配置 reportTo 且无默认聊天 ID，跳过飞书推送。`);
     return;
   }
 
   const token = await acquireFeishuToken();
   if (result.success) {
     const card = buildSchedulerResultCard(task, result.output, result.elapsed, result.diff);
-    await sendFeishuMessage(token, task.reportTo, card);
+    await sendFeishuMessage(token, chatId, card);
   } else {
     const card = buildErrorCard(task, result.error, result.elapsed);
-    await sendFeishuMessage(token, task.reportTo, card);
+    await sendFeishuMessage(token, chatId, card);
   }
-  await appendLog(`任务 [${task.id}] 飞书推送成功 -> ${task.reportTo}`);
+  await appendLog(`任务 [${task.id}] 飞书推送成功 -> ${chatId}`);
 }
 
 async function main() {
@@ -282,10 +393,11 @@ async function main() {
     for (const task of tasks) {
       const status = task.enabled ? '✓ 已启用' : '✗ 已禁用';
       console.log(`  [${task.id}] ${status}`);
-      console.log(`    ${task.description || '无描述'}`);
-      console.log(`    Agent: ${getProviderLabel(task.provider)}  Schedule: ${task.schedule}`);
-      console.log(`    Workspace: ${task.workspace}`);
-      console.log(`    Report to: ${task.reportTo || '(仅输出到 stdout)'}`);
+      console.log(`    调度:     ${task.schedule}`);
+      console.log(`    Agent:    ${getProviderLabel(task.provider)}${task.mode ? `  模式: ${task.mode}` : ''}`);
+      console.log(`    目录:     ${task.workspace}`);
+      console.log(`    指令:     ${(task.prompt || '').slice(0, 80)}${(task.prompt || '').length > 80 ? '...' : ''}`);
+      console.log(`    推送到:   ${task.reportTo || '(使用 DEFAULT_REPORT_CHAT_ID 或仅 stdout)'}`);
       console.log('');
     }
     return;
@@ -308,6 +420,16 @@ async function main() {
     console.log('  node src/scheduler.js --all             执行所有已启用任务');
     console.log('  node src/scheduler.js --list            列出所有任务');
     console.log('  node src/scheduler.js --dry-run --all   模拟执行（不实际调用 Agent）');
+    console.log('');
+    console.log('任务定义在 data/scheduled-tasks.json 中，字段说明:');
+    console.log('  schedule   [必填] 执行频率（通过 /cron add 创建时自动从简写生成）');
+    console.log('  workspace  [必填] Agent 执行的项目目录绝对路径');
+    console.log('  prompt     [必填] 发给 Agent 的指令内容');
+    console.log('  provider   [可选] Agent 类型: cursor/codex/claude/opencode（默认跟随 AGENT_PROVIDER）');
+    console.log('  mode       [可选] "plan" 只读审查模式，Agent 只分析不改代码');
+    console.log('  id         [可选] 任务唯一标识（通过 /cron add 创建时自动生成）');
+    console.log('  enabled    [可选] 是否启用（默认 true）');
+    console.log('  reportTo   [可选] 飞书聊天 ID，结果推送目标（留空使用 DEFAULT_REPORT_CHAT_ID）');
     return;
   }
 

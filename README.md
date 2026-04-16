@@ -43,6 +43,12 @@
 - `/sessions` 查看最近会话；私聊主面板里显示全局
 - `/status` 查看当前状态；私聊主面板里显示全局
 - `/clean` 清空会话；私聊里清空全部，群聊里清空当前群聊
+- `/cron` 查看定时任务列表
+- `/cron add <调度> <目录> <描述> [--provider X] [--mode plan]` 创建定时任务
+- `/cron run <id>` 立即手动执行一个定时任务
+- `/cron enable <id>` 启用定时任务
+- `/cron disable <id>` 禁用定时任务
+- `/cron delete <id>` 删除定时任务
 - `/help` 查看帮助
 - 任何以 `/` 开头但不属于已知命令的输入，都会被拦截，不会发送给 Codex
 
@@ -87,6 +93,7 @@ OPENCODE_BIN=opencode
 CODEX_SANDBOX=workspace-write
 CODEX_AUTO_APPROVAL=true
 CODEX_SKIP_GIT_REPO_CHECK=true
+DEFAULT_REPORT_CHAT_ID=oc_xxx
 ```
 
 说明：
@@ -99,6 +106,7 @@ CODEX_SKIP_GIT_REPO_CHECK=true
 - `CODEX_AUTO_APPROVAL=true` 会让 Codex 以无人值守方式执行，适合实验环境，风险更高
 - `CODEX_SKIP_GIT_REPO_CHECK=true` 允许你把工作目录指到非 git 仓库，适合 MVP 实验
 - 当 `CODEX_AUTO_APPROVAL=true` 时，Codex 会跳过审批并绕过 sandbox；如果你想保留 `workspace-write` 隔离，请把它设为 `false`
+- `DEFAULT_REPORT_CHAT_ID` 是定时任务结果推送的默认聊天 ID；任务配置里的 `reportTo` 为空时会使用这个值
 
 ## 启动
 
@@ -328,14 +336,127 @@ S1: 把 README 也补上
 - 工作目录
 - 转移 ID
 
+## 定时任务
+
+支持通过 cron 定时触发 Agent 执行代码审查、跑测试等周期性任务，结果自动推送到飞书。
+
+### 配置
+
+```bash
+# 1. 从示例创建任务配置
+cp data/scheduled-tasks.example.json data/scheduled-tasks.json
+
+# 2. 编辑任务（可选，不填 reportTo 会使用 .env 里的 DEFAULT_REPORT_CHAT_ID）
+vi data/scheduled-tasks.json
+```
+
+任务定义示例：
+
+```json
+{
+  "tasks": [
+    {
+      "id": "C1",
+      "enabled": true,
+      "schedule": "0 9 * * *",
+      "provider": "cursor",
+      "mode": "plan",
+      "workspace": "/Users/yumeng/q-skill",
+      "prompt": "审查最近的代码变更，给出改进建议。",
+      "reportTo": "",
+    }
+  ]
+}
+```
+
+字段说明：
+
+| 字段 | 必填 | 说明 | 默认值 |
+|------|------|------|--------|
+| `schedule` | **是** | 执行频率（通过 `/cron add` 创建时从简写自动生成） | — |
+| `workspace` | **是** | Agent 执行的项目目录绝对路径 | — |
+| `prompt` | **是** | 发给 Agent 的指令内容 | — |
+| `provider` | 否 | Agent 类型：`cursor` / `codex` / `claude` / `opencode` | 跟随 `AGENT_PROVIDER` 环境变量 |
+| `mode` | 否 | `"plan"` 表示只读审查模式，Agent 只分析不改代码 | 不设置 = 正常模式 |
+| `id` | 否 | 任务唯一标识，格式为 C1、C2、C3… | `/cron add` 时自动递增生成 |
+| `enabled` | 否 | 是否启用 | `true` |
+| `reportTo` | 否 | 飞书聊天 ID，结果推送目标 | `/cron add` 时自动填为当前聊天；留空则使用 `DEFAULT_REPORT_CHAT_ID` |
+
+### 手动执行
+
+```bash
+# 执行指定任务
+node src/scheduler.js --task C1
+
+# 模拟执行（不实际调用 Agent）
+node src/scheduler.js --dry-run --task C1
+
+# 执行所有已启用任务
+node src/scheduler.js --all
+
+# 查看任务列表
+node src/scheduler.js --list
+```
+
+### 安装到系统 cron
+
+```bash
+# 安装
+npm run schedule:install
+
+# 查看当前 crontab
+crontab -l
+
+# 卸载
+npm run schedule:uninstall
+```
+
+### 飞书内管理
+
+在飞书聊天中可直接管理定时任务：
+
+- `/cron` — 查看所有任务
+- `/cron add <调度> <目录> <描述> [--provider X] [--mode plan]` — 创建任务
+- `/cron run <id>` — 立即手动执行
+- `/cron enable <id>` — 启用任务
+- `/cron disable <id>` — 禁用任务
+- `/cron delete <id>` — 删除任务
+
+创建任务时，只需提供**调度**、**工作目录**、**任务描述**三个必填参数。`id`、`enabled`、`reportTo` 等字段自动填充（`reportTo` 默认为当前聊天）。可通过 `--provider` 和 `--mode` 覆盖默认值。
+
+调度格式：
+
+| 格式 | 含义 | 说明 |
+|------|------|------|
+| `hourly` | 每小时 | 整点执行 |
+| `hourly N` | 每 N 小时 | 如 `hourly 4` = 0:00, 4:00, 8:00… |
+| `daily` | 每天 9:00 | 默认早上 9 点 |
+| `daily H` | 每天 H 点 | 如 `daily 14` = 每天 14:00 |
+| `daily H:MM` | 每天 H:MM | 如 `daily 14:30` |
+| `weekly` | 每周一 9:00 | 默认周一早上 9 点 |
+| `weekly D` | 每周 D 的 9:00 | D: 0=周日, 1=周一, …6=周六 |
+| `weekly D H` | 每周 D 的 H 点 | 如 `weekly 1 10` = 每周一 10:00 |
+
+示例：
+
+```text
+/cron add daily /Users/yumeng/q-skill 审查最近的代码变更，给出改进建议
+/cron add hourly 4 /Users/yumeng/project 跑一次测试，分析失败原因
+/cron add daily 14 /Users/yumeng/q-skill 审查代码 --mode plan
+/cron add weekly 1 9 /Users/yumeng/project 每周一审查代码 --provider codex
+```
+
 ## 目录
 
 ```text
 src/config.js          环境变量读取
 src/agent-runner.js    Agent 执行器抽象，支持 Codex / Claude / Cursor / OpenCode
 src/session-store.js   聊天到多个 Agent 会话的持久化映射
+src/scheduler.js       定时任务调度入口
 src/index.js           飞书长连接入口
+scripts/install-schedule.sh  cron 安装/卸载辅助脚本
 data/sessions.json     运行时自动生成
+data/scheduled-tasks.json    定时任务定义（需手动创建）
 ```
 
 ## 已知限制
