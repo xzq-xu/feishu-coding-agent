@@ -356,16 +356,16 @@ async function runClaudeTurn({ sessionId, prompt, config, workspace }) {
   return runPrintAgent({ provider: 'claude', bin: config.claudeBin, args, workspace, sessionId, config });
 }
 
+const PLAN_MODE_PREFIX = '【只读审查，不要修改任何文件】';
+
 async function runCursorTurn({ sessionId, prompt, config, workspace }) {
   const chatId = sessionId || await createCursorChat(config, workspace);
   const args = ['-p', '--output-format', 'text', '--force', '--resume', chatId];
-  if (config.cursorMode) {
-    args.push('--mode', config.cursorMode);
-  }
   if (config.cursorModel) {
     args.push('--model', config.cursorModel);
   }
-  args.push(prompt);
+  const effectivePrompt = config.cursorMode === 'plan' ? `${PLAN_MODE_PREFIX}${prompt}` : prompt;
+  args.push(effectivePrompt);
   return runTextAgent({ provider: 'cursor', bin: config.cursorAgentBin, args, workspace, sessionId: chatId, config });
 }
 
